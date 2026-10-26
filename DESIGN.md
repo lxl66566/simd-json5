@@ -77,7 +77,7 @@ Criterion suite in `benches/`. Corpora: `twitter.json`, `citm_catalog.json`, `ca
 
 ## Dependency pins
 
-Runtime: `indexmap`, `thiserror`, `itoa`, `ryu`, plus a float-parsing crate from the fast-float family (`fast-float` or `fast-float2`; pick by byte-slice partial-parse API fit, `#[no_std]` compatibility and maintenance; do not hand-roll the Eisel-Lemire algorithm). Optional: `serde`. Dev: `serde_json`, `rand`, `criterion`, the competitor parsers above.
+Runtime: `indexmap`, `thiserror`, `itoa`, `ryu`, `memchr` (scalar string/comment scans), plus a float-parsing crate from the fast-float family (`fast-float` or `fast-float2`; pick by byte-slice partial-parse API fit, `#[no_std]` compatibility and maintenance; do not hand-roll the Eisel-Lemire algorithm). Optional: `serde`. Dev: `serde_json`, `rand`, `criterion`, the competitor parsers above.
 
 ## Process rules
 

@@ -27,6 +27,8 @@
 //! - Inside strings stage 1 only locates the closing quote, honoring backslash escapes; escape
 //!   validation happens in stage 2.
 
+use memchr::{memchr, memchr2};
+
 use crate::{Error, Result};
 
 /// Append structural offsets for `bytes` to `index`.
@@ -172,15 +174,15 @@ const fn build_classes() -> [u8; 256] {
 /// backslash escape parity. Escape contents are not validated here.
 pub(crate) fn skip_string(bytes: &[u8], open: usize) -> Result<usize> {
     let quote = bytes[open];
+    // `i` may overshoot the end by one on a dangling escape; the empty
+    // search range then reports the string as unterminated.
     let mut i = open + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            // May overshoot the end by one; the loop guard then reports
-            // the string as unterminated.
-            b'\\' => i += 2,
-            b if b == quote => return Ok(i + 1),
-            _ => i += 1,
+    while let Some(hit) = memchr2(quote, b'\\', &bytes[i.min(bytes.len())..]) {
+        let at = i + hit;
+        if bytes[at] == quote {
+            return Ok(at + 1);
         }
+        i = at + 2; // the backslash consumes the byte after it
     }
     Err(Error::UnterminatedString { offset: open })
 }
@@ -191,21 +193,21 @@ pub(crate) fn skip_comment(bytes: &[u8], slash: usize) -> Result<usize> {
         Some(b'/') => {
             // Line comment: runs to the newline (exclusive; the newline is
             // ordinary whitespace for the next iteration).
-            let nl = bytes[slash + 2..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(bytes.len() - (slash + 2));
+            let nl = memchr(b'\n', &bytes[slash + 2..]).unwrap_or(bytes.len() - (slash + 2));
             Ok((slash + 2 + nl + 1).min(bytes.len()))
         },
         Some(b'*') => {
             // Block comments do not nest: the first `*/` ends them. The
             // search starts after the opener so `/*/` stays unterminated.
             let mut i = slash + 2;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    return Ok(i + 2);
+            while let Some(hit) = memchr(b'/', &bytes[i..]) {
+                let at = i + hit;
+                // A `/` directly after the opener's `*` cannot close the
+                // comment (`/*/` stays open).
+                if at > slash + 2 && bytes[at - 1] == b'*' {
+                    return Ok(at + 1);
                 }
-                i += 1;
+                i = at + 1;
             }
             Err(Error::UnterminatedComment { offset: slash })
         },

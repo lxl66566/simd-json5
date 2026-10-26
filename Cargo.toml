@@ -15,6 +15,7 @@ fast-float2 = "0.2.4"
 fearless_simd = "1.2"
 indexmap  = "2"
 itoa = "1.0.18"
+memchr = "2.8.3"
 ryu = "1.0.23"
 serde = { version = "1.0.229", optional = true }
 thiserror = "2"

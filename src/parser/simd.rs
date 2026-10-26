@@ -40,6 +40,7 @@
 #[cfg(target_arch = "x86_64")]
 use fearless_simd::{Avx2, Avx512, u8x32, u8x64};
 use fearless_simd::{Level, Simd, dispatch, prelude::*, u8x16};
+use memchr::{memchr, memchr2};
 
 use super::stage1::{
     CLASSES, class, decode_seq, is_unicode_whitespace, skip_comment, skip_string, token_end,
@@ -383,16 +384,20 @@ fn classify_tables<S: Simd>(simd: S, blocks: [u8x16<S>; 4]) -> (u64, u64, u64) {
 /// backslash-consumes-the-next-byte semantics.
 fn skip_string_tail(bytes: &[u8], open: usize, mut i: usize, mut escaped: bool) -> Result<usize> {
     let quote = bytes[open];
-    while i < bytes.len() {
-        let b = bytes[i];
+    // `i` may overshoot the end by one on a dangling escape; the empty
+    // search range then reports the string as unterminated.
+    while let Some(hit) = memchr2(quote, b'\\', &bytes[i.min(bytes.len())..]) {
+        let at = i + hit;
         if escaped {
+            // The escaped byte is consumed whatever it is: it can neither
+            // close the string nor start a new escape.
             escaped = false;
-        } else if b == b'\\' {
-            escaped = true;
-        } else if b == quote {
-            return Ok(i + 1);
+            i = at + 1;
+        } else if bytes[at] == quote {
+            return Ok(at + 1);
+        } else {
+            i = at + 2; // the backslash consumes the byte after it
         }
-        i += 1;
     }
     Err(Error::UnterminatedString { offset: open })
 }
@@ -454,7 +459,7 @@ fn skip_line_simd<S: Simd>(simd: S, bytes: &[u8], from: usize) -> usize {
         }
         i += 64;
     }
-    match bytes[i..].iter().position(|&b| b == b'\n') {
+    match memchr(b'\n', &bytes[i..]) {
         Some(nl) => i + nl + 1,
         None => len,
     }
@@ -482,12 +487,19 @@ fn skip_block_simd<S: Simd>(simd: S, bytes: &[u8], slash: usize) -> Result<usize
         i += 64;
     }
     // Scalar tail; `prev_star` carries the boundary-straddling `*`.
-    while i < len {
-        if prev_star && bytes[i] == b'/' {
-            return Ok(i + 1);
+    while let Some(hit) = memchr(b'/', &bytes[i..]) {
+        let at = i + hit;
+        // The byte before the first candidate comes from the vector part;
+        // every later candidate has its predecessor inside the tail.
+        let prev_is_star = if hit == 0 {
+            prev_star
+        } else {
+            bytes[at - 1] == b'*'
+        };
+        if prev_is_star {
+            return Ok(at + 1);
         }
-        prev_star = bytes[i] == b'*';
-        i += 1;
+        i = at + 1;
     }
     Err(Error::UnterminatedComment { offset: slash })
 }
