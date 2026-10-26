@@ -14,8 +14,12 @@ env:
 
 jobs:
   check:
-    name: cargo check
-    runs-on: ubuntu-latest
+    name: cargo check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: cargo-bins/cargo-binstall@main
@@ -25,7 +29,10 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: cargo fmt
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
+      - name: cargo check (no default features)
+        run: cargo check --no-default-features --locked
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: cargo test

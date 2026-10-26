@@ -1,0 +1,215 @@
+//! Exact-output tests for the serializer, plus a cross-check against
+//! `serde_json` on JSON-representable values.
+
+use simd_json5::{Map, Str, Value, to_string, to_string_pretty, to_vec};
+
+fn object(pairs: impl IntoIterator<Item = (&'static str, Value<'static>)>) -> Value<'static> {
+    Value::Object(
+        pairs
+            .into_iter()
+            .map(|(k, v)| (Str::Static(k), v))
+            .collect::<Map<'_>>(),
+    )
+}
+
+#[test]
+fn scalars() {
+    assert_eq!(to_string(&Value::Null), "null");
+    assert_eq!(to_string(&Value::Bool(true)), "true");
+    assert_eq!(to_string(&Value::Bool(false)), "false");
+    assert_eq!(to_string(&Value::I64(0)), "0");
+    assert_eq!(to_string(&Value::I64(-1)), "-1");
+    assert_eq!(to_string(&Value::I64(i64::MIN)), "-9223372036854775808");
+    assert_eq!(to_string(&Value::I64(i64::MAX)), "9223372036854775807");
+    assert_eq!(to_string(&Value::U64(u64::MAX)), "18446744073709551615");
+    assert_eq!(to_string(&Value::F64(0.0)), "0.0");
+    assert_eq!(to_string(&Value::F64(-0.0)), "-0.0");
+    assert_eq!(to_string(&Value::F64(2.0)), "2.0");
+    assert_eq!(to_string(&Value::F64(0.15625)), "0.15625");
+    assert_eq!(to_string(&Value::F64(1e300)), "1e300");
+    assert_eq!(to_string(&Value::F64(5e-324)), "5e-324");
+}
+
+#[test]
+fn non_finite_literals() {
+    assert_eq!(to_string(&Value::F64(f64::NAN)), "NaN");
+    assert_eq!(to_string(&Value::F64(f64::INFINITY)), "Infinity");
+    assert_eq!(to_string(&Value::F64(f64::NEG_INFINITY)), "-Infinity");
+    assert_eq!(
+        to_string(&object([
+            ("nan", Value::F64(f64::NAN)),
+            ("inf", Value::F64(f64::INFINITY)),
+            ("ninf", Value::F64(f64::NEG_INFINITY)),
+        ])),
+        r#"{"nan":NaN,"inf":Infinity,"ninf":-Infinity}"#
+    );
+}
+
+#[test]
+fn string_escapes() {
+    let ser = |s: &str| to_string(&Value::Str(Str::Static(s)));
+    assert_eq!(ser(""), r#""""#);
+    assert_eq!(ser("plain"), r#""plain""#);
+    assert_eq!(ser("quote\"inside"), r#""quote\"inside""#);
+    assert_eq!(ser("back\\slash"), r#""back\\slash""#);
+    assert_eq!(ser("\u{8}\t\n\u{c}\r"), r#""\b\t\n\f\r""#);
+    assert_eq!(ser("\u{0}"), r#""\u0000""#);
+    assert_eq!(ser("\u{1}"), r#""\u0001""#);
+    assert_eq!(ser("\u{1f}"), r#""\u001f""#);
+    // 0x7f and everything above 0x20 (including U+2028/U+2029) pass through.
+    assert_eq!(ser("\u{7f}"), "\"\u{7f}\"");
+    assert_eq!(ser("a\u{2028}b\u{2029}c"), "\"a\u{2028}b\u{2029}c\"");
+    assert_eq!(ser("héllo → 😀"), "\"héllo → 😀\"");
+    // Escapes interleaved with multi-byte sequences.
+    assert_eq!(ser("é\té"), "\"é\\té\"");
+}
+
+#[test]
+fn nesting_and_containers() {
+    assert_eq!(to_string(&Value::Array(vec![])), "[]");
+    assert_eq!(to_string(&object([])), "{}");
+    assert_eq!(to_string(&Value::Array(vec![Value::I64(1)])), "[1]");
+    let nested = Value::Array(vec![
+        Value::I64(1),
+        Value::Array(vec![Value::Bool(true), Value::Null]),
+        object([("k", Value::F64(-0.5))]),
+    ]);
+    assert_eq!(to_string(&nested), r#"[1,[true,null],{"k":-0.5}]"#);
+    // Insertion order is preserved: keys emitted in first-seen order.
+    assert_eq!(
+        to_string(&object([
+            ("z", Value::I64(26)),
+            ("a", Value::I64(1)),
+            ("m", Value::I64(13)),
+        ])),
+        r#"{"z":26,"a":1,"m":13}"#
+    );
+}
+
+#[test]
+fn to_vec_matches_to_string() {
+    let value = object([("k", Value::Str(Str::Static("v\"")))]);
+    assert_eq!(to_vec(&value), to_string(&value).into_bytes());
+}
+
+#[test]
+fn display_matches_to_string() {
+    let value = sample();
+    assert_eq!(format!("{value}"), to_string(&value));
+}
+
+/// A DOM covering every `Value` variant, JSON-representable (finite floats).
+fn sample() -> Value<'static> {
+    Value::Array(vec![
+        Value::Null,
+        Value::Bool(true),
+        Value::Bool(false),
+        Value::I64(i64::MIN),
+        Value::I64(-42),
+        Value::U64(u64::from(u32::MAX)),
+        Value::U64(u64::MAX),
+        Value::F64(-0.0),
+        Value::F64(0.15625),
+        Value::F64(-2.5e-8),
+        Value::F64(1e300),
+        Value::Str(Str::Static("plain")),
+        Value::Str(Str::Dynamic(String::from(
+            "with \"quotes\" and \\ backslash",
+        ))),
+        Value::Str(Str::Static("tab\tnewline\ncr\r")),
+        Value::Str(Str::Static("\u{0}\u{1f}\u{7f}")),
+        Value::Str(Str::Static("héllo → 😀")),
+        Value::Str(Str::Static("linesep\u{2028}\u{2029}chars")),
+        Value::Array(vec![]),
+        Value::Array(vec![
+            Value::I64(1),
+            Value::Array(vec![Value::F64(2.0)]),
+            object([("inner", Value::Bool(false))]),
+        ]),
+        object([
+            ("", Value::I64(0)),
+            ("z", Value::I64(26)),
+            ("a", Value::U64(1)),
+            (
+                "nested",
+                object([("deep", Value::Array(vec![Value::Null]))]),
+            ),
+        ]),
+    ])
+}
+
+fn to_serde(value: &Value<'_>) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::I64(n) => (*n).into(),
+        Value::U64(n) => (*n).into(),
+        Value::F64(n) => {
+            serde_json::Value::Number(serde_json::Number::from_f64(*n).expect("finite float"))
+        },
+        Value::Str(s) => serde_json::Value::String(s.as_str().to_owned()),
+        Value::Array(items) => serde_json::Value::Array(items.iter().map(to_serde).collect()),
+        Value::Object(members) => serde_json::Value::Object(
+            members
+                .iter()
+                .map(|(k, v)| (k.as_str().to_owned(), to_serde(v)))
+                .collect(),
+        ),
+    }
+}
+
+#[test]
+fn pretty_formatting() {
+    assert_eq!(to_string_pretty(&Value::Null), "null");
+    assert_eq!(to_string_pretty(&Value::Array(vec![])), "[]");
+    assert_eq!(to_string_pretty(&object([])), "{}");
+    assert_eq!(to_string_pretty(&Value::F64(f64::NAN)), "NaN");
+    // Empty containers stay inline, exactly like serde_json.
+    let value = object([
+        ("empty", Value::Array(vec![])),
+        ("one", Value::I64(1)),
+        (
+            "nested",
+            Value::Array(vec![object([("deep", Value::Bool(true))])]),
+        ),
+    ]);
+    assert_eq!(
+        to_string_pretty(&value),
+        concat!(
+            "{\n",
+            "  \"empty\": [],\n",
+            "  \"one\": 1,\n",
+            "  \"nested\": [\n",
+            "    {\n",
+            "      \"deep\": true\n",
+            "    }\n",
+            "  ]\n",
+            "}"
+        )
+    );
+}
+
+#[test]
+fn pretty_matches_serde_json() {
+    let value = sample();
+    let expected = normalize_exponent(&serde_json::to_string_pretty(&to_serde(&value)).unwrap());
+    assert_eq!(normalize_exponent(&to_string_pretty(&value)), expected);
+}
+
+/// serde_json >= 1.0.15x formats float exponents through the `zmij` fork of
+/// ryu, which writes an explicit plus (`1e+300`) where ryu writes `1e300`.
+/// DESIGN pins our floats to ryu, so the comparison normalizes the sign away
+/// on both sides instead.
+fn normalize_exponent(text: &str) -> String {
+    text.replace("e+", "e")
+}
+
+#[test]
+fn compact_matches_serde_json() {
+    let value = sample();
+    let expected = normalize_exponent(&serde_json::to_string(&to_serde(&value)).unwrap());
+    assert_eq!(
+        normalize_exponent(&String::from_utf8(to_vec(&value)).unwrap()),
+        expected
+    );
+}

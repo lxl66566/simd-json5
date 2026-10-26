@@ -1,6 +1,41 @@
-//! Placeholder crate, replace with real code.
+//! SIMD-accelerated JSON5 parser and serializer.
+//!
+//! Parsing runs in two stages: a SIMD scan that indexes structural characters
+//! (comments, unquoted keys and single-quoted strings included), then a
+//! semantic pass that builds a zero-copy [`Value`] borrowing from the input.
+//! The output side emits strict JSON extended with the JSON5 `NaN` /
+//! `Infinity` literals, so serialized data is valid JSON whenever the value
+//! contains no non-finite float.
+//!
+//! ```
+//! let value = simd_json5::from_str("{ a: 1, // comment\n  b: [2, 3,] }").unwrap();
+//! assert_eq!(value["b"][0], simd_json5::Value::I64(2));
+//! ```
 
-/// Placeholder function, replace with real code.
-pub fn test() {
-    println!("Hello, world!");
+pub mod error;
+pub mod ser;
+pub mod value;
+
+#[cfg(feature = "serde")]
+pub mod de;
+#[cfg(feature = "serde")]
+pub mod typed;
+
+mod parser;
+
+pub use error::{Error, Result};
+pub use ser::{to_string, to_string_pretty, to_vec};
+pub use value::{MAX_DEPTH, Map, Str, Value};
+
+/// Parse a JSON5 document, borrowing string data from `s` where possible.
+pub fn from_str(s: &str) -> Result<Value<'_>> {
+    parser::parse(s.as_bytes())
+}
+
+/// Parse a JSON5 document from raw bytes; fails if `v` is not valid UTF-8.
+pub fn from_slice(v: &[u8]) -> Result<Value<'_>> {
+    let s = core::str::from_utf8(v).map_err(|e| Error::InvalidUtf8 {
+        offset: e.valid_up_to(),
+    })?;
+    parser::parse(s.as_bytes())
 }
