@@ -7,9 +7,9 @@
 //! `Infinity` literals, so serialized data is valid JSON whenever the value
 //! contains no non-finite float.
 //!
-//! Typed serialization (feature `serde`) accepts only string-like map keys;
-//! integer, bool or float keys are rejected with an error instead of being
-//! rendered as quoted strings the way `serde_json` does.
+//! Typed serialization (default feature `serde`) accepts only string-like map
+//! keys; integer, bool or float keys are rejected with an error instead of
+//! being rendered as quoted strings the way `serde_json` does.
 //!
 //! ```
 //! let value = simd_json5::from_str("{ a: 1, // comment\n  b: [2, 3,] }").unwrap();

@@ -1,0 +1,1 @@
+{"benchmark": "parse", "corpus": "canada.json", "impl": "json5", "mean_ns": 64530990531, "samples": 1, "one_shot": true, "note": "single sample: repeated measurement impractical (~65 s per parse, quadratic behavior on long arrays)"}

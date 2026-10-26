@@ -3,27 +3,55 @@ name         = "simd-json5"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.89"
-description  = "SIMD-accelerated JSON5 parser and serializer"
+description  = "Fastest JSON5 parser and serializer"
 repository   = "https://github.com/lxl66566/simd-json5"
 license      = "MIT OR Apache-2.0"
-keywords     = ["json5", "json", "simd", "parser", "serde"]
-categories   = ["parser-implementations", "encoding"]
-include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/src/**", "/tests/**", "!/benches/data/**"]
+keywords     = ["json", "json5", "parser", "serde", "simd"]
+categories   = ["encoding", "parser-implementations"]
+include      = [
+  "!/benches/data/**",
+  "!/benches/results/**",
+  "/CHANGELOG.md",
+  "/LICENSE-*",
+  "/README.md",
+  "/benches/**",
+  "/src/**",
+  "/tests/**"
+]
+
+[[bench]]
+harness = false
+name    = "parse"
+
+[[bench]]
+harness = false
+name    = "serialize"
 
 [dependencies]
-fast-float2 = "0.2.4"
+fast-float2   = "0.2"
 fearless_simd = "1.2"
-indexmap  = "2"
-itoa = "1.0.18"
-memchr = "2.8.3"
-serde = { version = "1.0.229", optional = true }
-simdutf8 = "0.1.5"
-thiserror = "2"
-zmij = "1.0.23"
+indexmap      = "2"
+itoa          = "1.0"
+memchr        = "2"
+serde         = { version = "1", optional = true }
+simdutf8      = "0.1"
+thiserror     = "2"
+zmij          = "1.0"
+
+[dev-dependencies]
+criterion     = "0.8"
+fearless_simd = { version = "1.2", features = ["force_support_fallback"] }
+json5         = "1.3.4"
+rand          = "0.10.3"
+serde         = { version = "1.0.229", features = ["derive"] }
+serde_json    = { version = "1.0.154", features = ["float_roundtrip", "preserve_order"] }
+serde_json5   = "0.2.1"
+simd-json     = "0.18.1"
+sonic-rs      = "0.5.10"
 
 [features]
-default = []
-serde = ["dep:serde"]
+default = ["serde"]
+serde   = ["dep:serde"]
 
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }
@@ -39,27 +67,9 @@ wildcard_imports        = "allow"
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 
+[profile.bench]
+debug         = 1
+codegen-units = 1
+
 [profile.release]
 codegen-units = 1
-
-[profile.bench]
-codegen-units = 1
-debug         = 1
-
-[[bench]]
-name    = "parse"
-harness = false
-
-[[bench]]
-name    = "serialize"
-harness = false
-
-[dev-dependencies]
-criterion = "0.7.0"
-fearless_simd = { version = "1.2", features = ["force_support_fallback"] }
-json5 = "1.3.4"
-rand = "0.10.3"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.154", features = ["float_roundtrip", "preserve_order"] }
-serde_json5 = "0.2.1"
-simd-json = "0.15.1"
