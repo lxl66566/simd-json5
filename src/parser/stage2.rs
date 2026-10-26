@@ -195,12 +195,11 @@ pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32]) -> Result<Value<'a>> {
                 if let Some(Frame::Object {
                     state, pending_key, ..
                 }) = stack.last_mut()
+                    && *state == ObjState::KeyOrClose
                 {
-                    if *state == ObjState::KeyOrClose {
-                        *state = ObjState::Colon;
-                        *pending_key = Some(s);
-                        continue;
-                    }
+                    *state = ObjState::Colon;
+                    *pending_key = Some(s);
+                    continue;
                 }
                 check_value_position(&stack, off)?;
                 deliver(&mut stack, &mut root, Value::Str(s));
@@ -209,18 +208,17 @@ pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32]) -> Result<Value<'a>> {
                 if let Some(Frame::Object {
                     state, pending_key, ..
                 }) = stack.last_mut()
+                    && *state == ObjState::KeyOrClose
                 {
-                    if *state == ObjState::KeyOrClose {
-                        // Unquoted number keys are invalid.
-                        if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
-                            return Err(syntax("expected identifier or string key", off));
-                        }
-                        let end = token_end(bytes, off);
-                        let key = parse_identifier(bytes, off, end)?;
-                        *state = ObjState::Colon;
-                        *pending_key = Some(key);
-                        continue;
+                    // Unquoted number keys are invalid.
+                    if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
+                        return Err(syntax("expected identifier or string key", off));
                     }
+                    let end = token_end(bytes, off);
+                    let key = parse_identifier(bytes, off, end)?;
+                    *state = ObjState::Colon;
+                    *pending_key = Some(key);
+                    continue;
                 }
                 check_value_position(&stack, off)?;
                 let v = if let Some(v) = keyword_value(bytes, off) {

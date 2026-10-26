@@ -59,8 +59,9 @@ See the module doc in `src/parser/stage1.rs`; it is the authoritative copy. Summ
 
 ## SIMD plan
 
-- Backends live in `src/parser/simd.rs`; the parser routes through `simd::build_index` (see `src/parser/mod.rs`). x86_64: SSE2 (baseline) and AVX2 (runtime-detected, cached once per process in a `OnceLock`). Every other target, including aarch64, runs the canonical scalar `stage1::build_index`; no NEON kernel is shipped (cannot be differentially verified here — correct-and-slower beats subtly-wrong).
-- Algorithm: 64-byte unaligned blocks; a vector whitespace mask yields an attention mask (its complement); a scalar walk of attention bits emits token starts, dispatches to vectorized string skipping (simdjson's odd-backslash-run escape parity with cross-block carry) and vectorized comment skipping (`*`/`/` masks with `prev_star` carry), and takes the Unicode-whitespace slow path on high-bit bytes. The trailing partial block is finished by a scalar tail carrying the in-token flag.
+- Backends live in `src/parser/simd.rs`; the parser routes through `simd::build_index` (see `src/parser/mod.rs`). One generic kernel is monomorphized per ISA through `fearless_simd`'s `dispatch!`, which also enables each ISA's target features: SSE2, SSE4.2, AVX2 and Ice-Lake AVX-512 on x86_64, NEON on aarch64, SIMD128 on wasm32. Targets with no supported vector ISA (`Fallback` level) run the canonical scalar `stage1::build_index`, which beats emulated vectors.
+- Algorithm: 64-byte unaligned blocks (four 128-bit lanes); a vector whitespace mask yields an attention mask (its complement); a scalar walk of attention bits emits token starts, dispatches to vectorized string skipping (simdjson's odd-backslash-run escape parity with cross-block carry) and vectorized comment skipping (`*`/`/` masks with `prev_star` carry), and takes the Unicode-whitespace slow path on high-bit bytes. The trailing partial block is finished by a scalar tail carrying the in-token flag.
+- Byte classification: nibble lookup tables through dynamic byte shuffles (the simdjson pshufb scheme) on ISAs with a native shuffle; compare chains on SSE2 and the fallback, whose dynamic shuffles are emulated per lane.
 - Correctness over cleverness: the SIMD path may bail to the scalar path at any construct it cannot handle, but must not produce different output.
 
 ## Testing strategy

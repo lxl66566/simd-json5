@@ -7,9 +7,9 @@ zero-copy DOM borrowing from the input. Serialization emits strict JSON
 extended with the JSON5 `NaN` / `Infinity` / `-Infinity` literals, so output
 is valid JSON whenever the value contains no non-finite float.
 
-**Status: under active development.** Parsing (SIMD stage 1 on x86_64),
-serialization and the serde integration are working; see `DESIGN.md` for the
-architecture contract.
+**Status: under active development.** Parsing (SIMD stage 1 on x86_64,
+aarch64 and wasm32), serialization and the serde integration are working; see
+`DESIGN.md` for the architecture contract.
 
 ## Usage
 
@@ -49,7 +49,7 @@ assert_eq!(simd_json5::typed::to_string(&p).unwrap(), r#"{"x":1,"y":2}"#);
 
 ## MSRV
 
-Rust 1.85 (edition 2024). Development (nightly `rustfmt`/`clippy` settings)
+Rust 1.89 (edition 2024). Development (nightly `rustfmt`/`clippy` settings)
 uses the nightly toolchain.
 
 ## License

@@ -2,7 +2,7 @@
 name         = "simd-json5"
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description  = "SIMD-accelerated JSON5 parser and serializer"
 repository   = "https://github.com/lxl66566/simd-json5"
 license      = "MIT OR Apache-2.0"
@@ -12,6 +12,7 @@ include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/sr
 
 [dependencies]
 fast-float2 = "0.2.4"
+fearless_simd = "1.2"
 indexmap  = "2"
 itoa = "1.0.18"
 ryu = "1.0.23"
@@ -53,6 +54,7 @@ harness = false
 
 [dev-dependencies]
 criterion = "0.7.0"
+fearless_simd = { version = "1.2", features = ["force_support_fallback"] }
 json5 = "1.3.4"
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }

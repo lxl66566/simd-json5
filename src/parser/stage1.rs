@@ -1,6 +1,7 @@
 //! Stage 1: structural indexer.
 //!
-//! Contract that every backend (scalar, SSE2, AVX2, NEON) must uphold:
+//! Contract that every backend (the scalar scan and every SIMD level
+//! dispatched in [`super::simd`]) must uphold:
 //!
 //! - `build_index` appends strictly ascending byte offsets into `bytes`.
 //! - An offset is emitted for:
@@ -26,15 +27,14 @@
 //! - Inside strings stage 1 only locates the closing quote, honoring backslash escapes; escape
 //!   validation happens in stage 2.
 
-#[cfg(any(test, not(target_arch = "x86_64")))]
 use crate::{Error, Result};
 
 /// Append structural offsets for `bytes` to `index`.
 ///
-/// Canonical scalar reference: the production path on non-x86_64 targets and
-/// the differential-test oracle for the SIMD kernels in [`super::simd`]; on
-/// x86_64 the parser routes through the SIMD dispatch instead.
-#[cfg(any(test, not(target_arch = "x86_64")))]
+/// Canonical scalar reference: the production path on targets with no
+/// supported vector ISA and the differential-test oracle for the SIMD
+/// kernels in [`super::simd`]; elsewhere the parser routes through the SIMD
+/// dispatch instead.
 #[allow(clippy::cast_possible_truncation)] // guarded by the length check below
 pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
     if bytes.len() > u32::MAX as usize {
@@ -170,8 +170,7 @@ const fn build_classes() -> [u8; 256] {
 
 /// Position just past the string whose opening quote is at `open`, honoring
 /// backslash escape parity. Escape contents are not validated here.
-#[cfg(any(test, not(target_arch = "x86_64")))]
-fn skip_string(bytes: &[u8], open: usize) -> Result<usize> {
+pub(crate) fn skip_string(bytes: &[u8], open: usize) -> Result<usize> {
     let quote = bytes[open];
     let mut i = open + 1;
     while i < bytes.len() {
@@ -187,8 +186,7 @@ fn skip_string(bytes: &[u8], open: usize) -> Result<usize> {
 }
 
 /// Position just past the comment whose `/` is at `slash`.
-#[cfg(any(test, not(target_arch = "x86_64")))]
-fn skip_comment(bytes: &[u8], slash: usize) -> Result<usize> {
+pub(crate) fn skip_comment(bytes: &[u8], slash: usize) -> Result<usize> {
     match bytes.get(slash + 1) {
         Some(b'/') => {
             // Line comment: runs to the newline (exclusive; the newline is
@@ -221,7 +219,6 @@ fn skip_comment(bytes: &[u8], slash: usize) -> Result<usize> {
 
 /// ASCII token bytes: identifier characters, number characters and the
 /// backslash that may start a `\uXXXX` identifier escape.
-#[cfg(any(test, not(target_arch = "x86_64")))]
 fn is_ascii_token_byte(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'$' | b'_' | b'+' | b'-' | b'.' | b'\\')
 }

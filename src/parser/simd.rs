@@ -1,22 +1,22 @@
 //! SIMD backends for the stage-1 structural indexer.
 //!
 //! This module implements the stage-1 contract (see the module documentation
-//! of [`super::stage1`], the authoritative copy) with vector kernels and a
-//! cached dispatch:
+//! of [`super::stage1`], the authoritative copy) with vector kernels built on
+//! [`fearless_simd`]:
 //!
-//! - x86_64: an SSE2 kernel (baseline ISA, always available). An AVX2 kernel is selected once per
-//!   process through a `OnceLock`, so the CPU probe never runs on the hot path.
-//! - every other target (including aarch64): the canonical scalar [`super::stage1::build_index`]. A
-//!   NEON kernel cannot be run or differentially verified on the machines available to this branch
-//!   (NEON has no movemask; a hand-derived bit-extraction chain would be exactly the kind of
-//!   subtly-wrong code the differential tests exist to catch), so the canonical scalar scan stands
-//!   in for it: correct-and-slower beats subtly-wrong. The non-x86_64 routing is compile-checked
-//!   for `aarch64-unknown-linux-gnu`.
+//! - one generic kernel, monomorphized per ISA through `dispatch!`, which also enables each ISA's
+//!   target features: SSE2, SSE4.2, AVX2 and Ice-Lake AVX-512 on x86_64, NEON on aarch64, SIMD128
+//!   on wasm32;
+//! - the scalar `Fallback` level routes to the canonical [`super::stage1::build_index`]: emulated
+//!   vectors lose to the scalar scan by a wide margin;
+//! - byte classification runs through nibble lookup tables and dynamic byte shuffles (the simdjson
+//!   pshufb scheme) where the ISA provides a native shuffle, and through compare chains on SSE2 and
+//!   the fallback, whose dynamic shuffles are emulated per lane.
 //!
-//! Kernel algorithm (one 64-byte block per iteration):
+//! Kernel algorithm (one 64-byte block, four 128-bit lanes per iteration):
 //!
-//! 1. Classify the block with vector compares, producing a 64-bit whitespace mask; its complement
-//!    (`attention mask`) marks every byte that needs a scalar decision.
+//! 1. Classify the block, producing a 64-bit whitespace mask; its complement (`attention mask`)
+//!    marks every byte that needs a scalar decision.
 //! 2. Walk the set bits of the attention mask. Whitespace runs are skipped for free; token starts
 //!    are emitted here; `/` dispatches to the vectorized comment skippers and quotes to the
 //!    vectorized string skipper (escape parity via simdjson's odd-backslash-run trick, see
@@ -32,11 +32,21 @@
 //! differential tests in this module enforce that against the canonical
 //! scalar implementation.
 
-use super::stage1::{CLASSES, class, decode_seq, is_unicode_whitespace, token_end};
+// inline(always) on the kernel and every helper is load-bearing: the generic
+// body must fold into the feature-enabled closure that `dispatch!` builds
+// around each backend, or the vector code would be compiled without the ISA.
+#![allow(clippy::inline_always)]
+
+#[cfg(target_arch = "x86_64")]
+use fearless_simd::{Avx2, Avx512, u8x32, u8x64};
+use fearless_simd::{Level, Simd, dispatch, prelude::*, u8x16};
+
+use super::stage1::{
+    CLASSES, class, decode_seq, is_unicode_whitespace, skip_comment, skip_string, token_end,
+};
 use crate::{Error, Result};
 
 /// Reject inputs whose offsets do not fit `u32`; mirrors the canonical guard.
-#[cfg(target_arch = "x86_64")]
 fn check_input_len(bytes: &[u8]) -> Result<()> {
     if bytes.len() > u32::MAX as usize {
         return Err(Error::Syntax {
@@ -47,17 +57,330 @@ fn check_input_len(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Position just past the string whose opening quote is at `open`, honoring
-/// backslash escape parity. Mirrors the private canonical `skip_string`.
+/// Dispatch entry for the parser: selects the best kernel for the current
+/// CPU.
+///
+/// - every SIMD level: the generic [`scan_simd`] kernel with the ISA's target features enabled by
+///   `dispatch!`;
+/// - `Fallback`: the canonical scalar [`super::stage1::build_index`].
+pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+    check_input_len(bytes)?;
+    let level = Level::new();
+    if level.is_fallback() {
+        return super::stage1::build_index(bytes, index);
+    }
+    dispatch!(level, simd => scan_simd(simd, bytes, index))
+}
+
+/// Mask of the bytes equal to `byte` in one 128-bit lane, in the low 16 bits.
+#[inline(always)]
+fn eq_mask16<S: Simd>(simd: S, lane: u8x16<S>, byte: u8) -> u64 {
+    lane.simd_eq(simd.splat_u8x16(byte)).to_bitmask()
+}
+
+/// Mask of the bytes whose unsigned value is `<= bound`, in the low 16 bits.
+#[inline(always)]
+fn le_mask16<S: Simd>(simd: S, lane: u8x16<S>, bound: u8) -> u64 {
+    lane.simd_le(simd.splat_u8x16(bound)).to_bitmask()
+}
+
+/// OR of the equality masks for `byte` over the 64 bytes at `i`, loaded at
+/// the level's native width: one compare per 64 bytes on AVX-512, two on
+/// AVX2, four on 128-bit ISAs. Callers guarantee 64 readable bytes at `i`.
+#[inline(always)]
+fn eq_mask_native<S: Simd>(simd: S, bytes: &[u8], i: usize, byte: u8) -> u64 {
+    let width = <S::u8s as SimdBase<S>>::LEN;
+    let all = [byte; 64];
+    let needle = <S::u8s as SimdBase<S>>::from_slice(simd, &all[..width]);
+    let mut acc = 0_u64;
+    let mut k = 0;
+    while k < 64 {
+        acc |= <S::u8s as SimdBase<S>>::from_slice(simd, &bytes[i + k..i + k + width])
+            .simd_eq(needle)
+            .to_bitmask()
+            << k;
+        k += width;
+    }
+    acc
+}
+
+/// Load 64 bytes at `i` as four 128-bit lanes, unaligned like the scalar
+/// reads they replace. Callers guarantee 64 readable bytes at `i`.
+#[inline(always)]
+fn load64<S: Simd>(simd: S, bytes: &[u8], i: usize) -> [u8x16<S>; 4] {
+    [
+        u8x16::from_slice(simd, &bytes[i..i + 16]),
+        u8x16::from_slice(simd, &bytes[i + 16..i + 32]),
+        u8x16::from_slice(simd, &bytes[i + 32..i + 48]),
+        u8x16::from_slice(simd, &bytes[i + 48..i + 64]),
+    ]
+}
+
+/// Classification strategy for one scan. `Simd::level()` is a real call that
+/// cannot fold inside the block loop, so the level is inspected once per
+/// scan and the per-block dispatch is a match on this value.
+#[derive(Clone, Copy)]
+enum Classifier<S: Simd> {
+    /// Nibble tables where dynamic shuffles are native, compare chains
+    /// otherwise (all levels except the x86 wide lanes).
+    Generic { tables: bool, simd: S },
+    #[cfg(target_arch = "x86_64")]
+    Avx2(Avx2),
+    #[cfg(target_arch = "x86_64")]
+    Avx512(Avx512),
+}
+
+/// Inspect the level once per scan.
+fn classifier<S: Simd>(simd: S) -> Classifier<S> {
+    #[cfg(target_arch = "x86_64")]
+    match simd.level() {
+        Level::Avx512(tok) => return Classifier::Avx512(tok),
+        Level::Avx2(tok) => return Classifier::Avx2(tok),
+        _ => {},
+    }
+    Classifier::Generic {
+        tables: tables_native(simd),
+        simd,
+    }
+}
+
+/// Classify the 64 bytes at `i`: `(whitespace, token, structural)` masks,
+/// where whitespace is exactly `0x09..=0x0D` and `0x20`, and the other two
+/// are the stage-1 token and structural byte sets (see `CLASSES`). Callers
+/// guarantee 64 readable bytes at `i`.
+#[inline(always)]
+fn classify_with<S: Simd>(c: Classifier<S>, bytes: &[u8], i: usize) -> (u64, u64, u64) {
+    match c {
+        Classifier::Generic { tables, simd } => {
+            let blocks = load64(simd, bytes, i);
+            if tables {
+                classify_tables(simd, blocks)
+            } else {
+                classify_compares(simd, blocks)
+            }
+        },
+        #[cfg(target_arch = "x86_64")]
+        Classifier::Avx2(tok) => classify_avx2(tok, bytes, i),
+        #[cfg(target_arch = "x86_64")]
+        Classifier::Avx512(tok) => classify_avx512(tok, bytes, i),
+    }
+}
+
+/// Whether this level lowers dynamic byte shuffles to a native instruction.
+fn tables_native<S: Simd>(simd: S) -> bool {
+    if simd.level().is_fallback() {
+        return false;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if matches!(simd.level(), Level::Sse2(_)) {
+        return false;
+    }
+    true
+}
+
+/// Compare-chain classification: byte classes from unsigned range and
+/// equality compares. Used on levels without a native dynamic byte shuffle
+/// (SSE2, the fallback), whose emulated shuffles cost more than this whole
+/// chain.
+#[inline(always)]
+fn classify_compares<S: Simd>(simd: S, blocks: [u8x16<S>; 4]) -> (u64, u64, u64) {
+    let mut ws = 0_u64;
+    let mut tok = 0_u64;
+    let mut special = 0_u64;
+    for (lane, b) in blocks.into_iter().enumerate() {
+        // Token set: [0-9] [A-Z] [a-z] $ _ + - . \ (see CLASSES).
+        let dig = le_mask16(simd, b, b'9') & !le_mask16(simd, b, b'/');
+        let upper = le_mask16(simd, b, b'Z') & !le_mask16(simd, b, b'@');
+        let lower = le_mask16(simd, b, b'z') & !le_mask16(simd, b, b'`');
+        let extra = eq_mask16(simd, b, b'$')
+            | eq_mask16(simd, b, b'_')
+            | eq_mask16(simd, b, b'+')
+            | eq_mask16(simd, b, b'-')
+            | eq_mask16(simd, b, b'.')
+            | eq_mask16(simd, b, b'\\');
+        // No range trick here: 0x5C (`\`) and 0x7C (`|`) sit inside the
+        // bracket ranges but are not structural.
+        let special_lane = eq_mask16(simd, b, b'{')
+            | eq_mask16(simd, b, b'}')
+            | eq_mask16(simd, b, b'[')
+            | eq_mask16(simd, b, b']')
+            | eq_mask16(simd, b, b',')
+            | eq_mask16(simd, b, b':');
+        let ws_lane =
+            (le_mask16(simd, b, 0x0d) & !le_mask16(simd, b, 0x08)) | eq_mask16(simd, b, b' ');
+        let shift = 16 * lane;
+        tok |= (dig | upper | lower | extra) << shift;
+        special |= special_lane << shift;
+        ws |= ws_lane << shift;
+    }
+    (ws, tok, special)
+}
+
+static WS_LUT: [u8; 16] = [
+    0x20, 100, 100, 100, 17, 100, 113, 2, 100, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 100, 100,
+];
+static LO_LUT: [u8; 16] = [
+    0x1a, 0x1e, 0x1e, 0x1e, 0x1f, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x9c, 0x25, 0x4c, 0x25, 0x05, 0x0c,
+];
+static HI_LUT: [u8; 16] = [
+    0x00, 0x00, 0x41, 0x82, 0x04, 0x28, 0x04, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Duplicate a 16-byte table across both 128-bit lanes of a 32-byte table.
+const fn doubled(lut: [u8; 16]) -> [u8; 32] {
+    let mut out = [0_u8; 32];
+    let mut half = 0;
+    while half < 2 {
+        let mut k = 0;
+        while k < 16 {
+            out[half * 16 + k] = lut[k];
+            k += 1;
+        }
+        half += 1;
+    }
+    out
+}
+
+static WS_LUT32: [u8; 32] = doubled(WS_LUT);
+static LO_LUT32: [u8; 32] = doubled(LO_LUT);
+static HI_LUT32: [u8; 32] = doubled(HI_LUT);
+
+/// Quadruple a 16-byte table across the four 128-bit lanes of a 64-byte
+/// table.
+const fn quadrupled(lut: [u8; 16]) -> [u8; 64] {
+    let mut out = [0_u8; 64];
+    let mut quarter = 0;
+    while quarter < 4 {
+        let mut k = 0;
+        while k < 16 {
+            out[quarter * 16 + k] = lut[k];
+            k += 1;
+        }
+        quarter += 1;
+    }
+    out
+}
+
+static WS_LUT64: [u8; 64] = quadrupled(WS_LUT);
+static LO_LUT64: [u8; 64] = quadrupled(LO_LUT);
+static HI_LUT64: [u8; 64] = quadrupled(HI_LUT);
+
+/// AVX2 classification through native 256-bit lanes: two lanes of
+/// shuffle-fed nibble lookups (the [`classify_tables`] scheme, see its
+/// documentation) at simdjson's original op count.
 #[cfg(target_arch = "x86_64")]
-fn skip_string(bytes: &[u8], open: usize) -> Result<usize> {
-    skip_string_tail(bytes, open, open + 1, false)
+#[inline(always)]
+fn classify_avx2(simd: Avx2, bytes: &[u8], i: usize) -> (u64, u64, u64) {
+    let ws_lut = u8x32::from_slice(simd, &WS_LUT32);
+    let lo_lut = u8x32::from_slice(simd, &LO_LUT32);
+    let hi_lut = u8x32::from_slice(simd, &HI_LUT32);
+    let zero = simd.splat_u8x32(0);
+    let mut ws = 0_u64;
+    let mut tok = 0_u64;
+    let mut special = 0_u64;
+    for (lane, b) in [
+        u8x32::from_slice(simd, &bytes[i..i + 32]),
+        u8x32::from_slice(simd, &bytes[i + 32..i + 64]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lo = b & 0x0f;
+        let cls = simd.swizzle_dyn_within_blocks_u8x32(lo_lut, lo)
+            & simd.swizzle_dyn_within_blocks_u8x32(hi_lut, b >> 4);
+        let ws_lane = b.simd_eq(simd.swizzle_dyn_within_blocks_u8x32(ws_lut, lo));
+        let tok_lane = (cls & 0x1f).simd_ne(zero);
+        let special_lane = ((cls >> 5) & 0x07).simd_ne(zero);
+        let shift = 32 * lane;
+        ws |= ws_lane.to_bitmask() << shift;
+        tok |= tok_lane.to_bitmask() << shift;
+        special |= special_lane.to_bitmask() << shift;
+    }
+    (ws, tok, special)
+}
+
+/// AVX-512 classification: one full-width `vpermb` lookup per table over the
+/// whole 64-byte block (the [`classify_tables`] scheme, see its
+/// documentation), with the three masks converting through compact `k`
+/// registers.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn classify_avx512(simd: Avx512, bytes: &[u8], i: usize) -> (u64, u64, u64) {
+    let ws_lut = u8x64::from_slice(simd, &WS_LUT64);
+    let lo_lut = u8x64::from_slice(simd, &LO_LUT64);
+    let hi_lut = u8x64::from_slice(simd, &HI_LUT64);
+    let zero = simd.splat_u8x64(0);
+    let b = u8x64::from_slice(simd, &bytes[i..i + 64]);
+    let lo = b & 0x0f;
+    let cls = simd.swizzle_dyn_u8x64(lo_lut, lo) & simd.swizzle_dyn_u8x64(hi_lut, b >> 4);
+    let ws = b.simd_eq(simd.swizzle_dyn_u8x64(ws_lut, lo));
+    let tok = (cls & 0x1f).simd_ne(zero);
+    let special = ((cls >> 5) & 0x07).simd_ne(zero);
+    (ws.to_bitmask(), tok.to_bitmask(), special.to_bitmask())
+}
+
+/// Nibble-table classification (the simdjson scheme): one shuffle per nibble
+/// replaces the compare chains, producing all three masks in a handful of
+/// vector ops per 128-bit lane.
+///
+/// Whitespace uses a self-match table: the entry a byte's low nibble
+/// selects equals the byte itself exactly for the six whitespace bytes
+/// (every filler value's own low nibble differs from its index, so it can
+/// never compare equal). simdjson's table extended with VT (`0x0B`) and FF
+/// (`0x0C`) for JSON5.
+///
+/// Token and structural bytes come from two rectangle tables: each bit b
+/// below owns one rectangle `H_b x L_b` (high-nibble set times low-nibble
+/// set) of the target byte sets, and a byte's class is the AND of the bits
+/// its two nibbles select:
+///
+/// ```text
+/// bit 0: h{2}   x l{4,B,D,E}    $ + - .
+/// bit 1: h{3}   x l{0-9}        0-9
+/// bit 2: h{4,6} x l{1-F}        A-O, a-o
+/// bit 3: h{5}   x l{0-A,C,F}    P-Z, backslash, _
+/// bit 4: h{7}   x l{0-A}        p-z
+/// bit 5: h{5,7} x l{B,D}        [ ] { }
+/// bit 6: h{2}   x l{C}          ,
+/// bit 7: h{3}   x l{A}          :
+/// ```
+///
+/// Bits 0-4 mark token rectangles and bits 5-7 structural ones, so a nonzero
+/// low-half byte means token and a nonzero top-three-bits byte means
+/// structural. The rectangles are exact products, and the 256-value
+/// exhaustive test below pins the tables to `CLASSES`.
+///
+/// Nibbles are masked explicitly before the lookup: dynamic-shuffle index
+/// semantics differ per ISA (x86 `pshufb` indexes by the low 4 bits, NEON
+/// `tbl` zeroes out-of-range indices), and masked nibbles make the lookup
+/// identical everywhere.
+#[inline(always)]
+fn classify_tables<S: Simd>(simd: S, blocks: [u8x16<S>; 4]) -> (u64, u64, u64) {
+    let ws_lut = u8x16::from_slice(simd, &WS_LUT);
+    let lo_lut = u8x16::from_slice(simd, &LO_LUT);
+    let hi_lut = u8x16::from_slice(simd, &HI_LUT);
+    let zero = simd.splat_u8x16(0);
+    let mut ws = 0_u64;
+    let mut tok = 0_u64;
+    let mut special = 0_u64;
+    for (lane, b) in blocks.into_iter().enumerate() {
+        let lo = b & 0x0f;
+        let cls = simd.swizzle_dyn_within_blocks_u8x16(lo_lut, lo)
+            & simd.swizzle_dyn_within_blocks_u8x16(hi_lut, b >> 4);
+        let ws_lane = b.simd_eq(simd.swizzle_dyn_within_blocks_u8x16(ws_lut, lo));
+        let tok_lane = (cls & 0x1f).simd_ne(zero);
+        let special_lane = ((cls >> 5) & 0x07).simd_ne(zero);
+        let shift = 16 * lane;
+        ws |= ws_lane.to_bitmask() << shift;
+        tok |= tok_lane.to_bitmask() << shift;
+        special |= special_lane.to_bitmask() << shift;
+    }
+    (ws, tok, special)
 }
 
 /// Scalar string skip from `i` with an incoming escape-parity flag (used when
 /// the vector part of a skip ends mid-escape). Mirrors the canonical
 /// backslash-consumes-the-next-byte semantics.
-#[cfg(target_arch = "x86_64")]
 fn skip_string_tail(bytes: &[u8], open: usize, mut i: usize, mut escaped: bool) -> Result<usize> {
     let quote = bytes[open];
     while i < bytes.len() {
@@ -74,26 +397,44 @@ fn skip_string_tail(bytes: &[u8], open: usize, mut i: usize, mut escaped: bool) 
     Err(Error::UnterminatedString { offset: open })
 }
 
-/// Position just past the comment whose `/` is at `slash`; mirrors the private
-/// canonical `skip_comment` (line comments end after the newline or at end of
-/// input; block comments end at the first `*/`, `/*/` stays unterminated).
-#[cfg(target_arch = "x86_64")]
-fn skip_comment(bytes: &[u8], slash: usize) -> Result<usize> {
+/// Vectorized string skip: returns the position just past the closing quote
+/// of the string opened at `open`, or the canonical unterminated error.
+#[inline(always)]
+fn skip_string_simd<S: Simd>(simd: S, bytes: &[u8], open: usize) -> Result<usize> {
+    let quote = bytes[open];
+    let len = bytes.len();
+    let mut i = open + 1;
+    let mut ends_odd = false;
+    while i + 64 <= len {
+        let bs = eq_mask_native(simd, bytes, i, b'\\');
+        let quotes = eq_mask_native(simd, bytes, i, quote);
+        // A quote closes the string only when not escaped. With no
+        // backslashes in the block the parity chain degenerates: the only
+        // escape shadow is the carry-in on byte 0, and the carry always ends
+        // here (matches odd_backslash_ends on a zero mask), so the ~10-op
+        // chain is skipped for the common backslash-free block.
+        let closers = if bs == 0 {
+            let carried = u64::from(ends_odd);
+            ends_odd = false;
+            quotes & !carried
+        } else {
+            quotes & !odd_backslash_ends(bs, &mut ends_odd)
+        };
+        if closers != 0 {
+            return Ok(i + closers.trailing_zeros() as usize + 1);
+        }
+        i += 64;
+    }
+    // Scalar tail, carrying the pending escape parity.
+    skip_string_tail(bytes, open, i, ends_odd)
+}
+
+/// Vectorized comment skip mirroring [`skip_comment`].
+#[inline(always)]
+fn skip_comment_simd<S: Simd>(simd: S, bytes: &[u8], slash: usize) -> Result<usize> {
     match bytes.get(slash + 1) {
-        Some(b'/') => Ok(match bytes[slash + 2..].iter().position(|&b| b == b'\n') {
-            Some(nl) => slash + 2 + nl + 1,
-            None => bytes.len(),
-        }),
-        Some(b'*') => {
-            let mut i = slash + 2;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    return Ok(i + 2);
-                }
-                i += 1;
-            }
-            Err(Error::UnterminatedComment { offset: slash })
-        },
+        Some(b'/') => Ok(skip_line_simd(simd, bytes, slash + 2)),
+        Some(b'*') => skip_block_simd(simd, bytes, slash),
         _ => Err(Error::UnexpectedChar {
             byte: b'/',
             offset: slash,
@@ -101,11 +442,84 @@ fn skip_comment(bytes: &[u8], slash: usize) -> Result<usize> {
     }
 }
 
+/// Line comment: position just past the next `\n`, or the end of input.
+#[inline(always)]
+fn skip_line_simd<S: Simd>(simd: S, bytes: &[u8], from: usize) -> usize {
+    let len = bytes.len();
+    let mut i = from;
+    while i + 64 <= len {
+        let lf = eq_mask_native(simd, bytes, i, b'\n');
+        if lf != 0 {
+            return i + lf.trailing_zeros() as usize + 1;
+        }
+        i += 64;
+    }
+    match bytes[i..].iter().position(|&b| b == b'\n') {
+        Some(nl) => i + nl + 1,
+        None => len,
+    }
+}
+
+/// Block comment: position just past the first `*/`, or the canonical
+/// unterminated error.
+#[inline(always)]
+fn skip_block_simd<S: Simd>(simd: S, bytes: &[u8], slash: usize) -> Result<usize> {
+    let len = bytes.len();
+    let mut i = slash + 2;
+    // Set when byte `i - 1` is `*` (a `*/` may straddle a block boundary).
+    let mut prev_star = false;
+    while i + 64 <= len {
+        let stars = eq_mask_native(simd, bytes, i, b'*');
+        let slashes = eq_mask_native(simd, bytes, i, b'/');
+        let mut closers = (stars << 1) & slashes;
+        if prev_star && slashes & 1 != 0 {
+            closers |= 1;
+        }
+        if closers != 0 {
+            return Ok(i + closers.trailing_zeros() as usize + 1);
+        }
+        prev_star = stars >> 63 != 0;
+        i += 64;
+    }
+    // Scalar tail; `prev_star` carries the boundary-straddling `*`.
+    while i < len {
+        if prev_star && bytes[i] == b'/' {
+            return Ok(i + 1);
+        }
+        prev_star = bytes[i] == b'*';
+        i += 1;
+    }
+    Err(Error::UnterminatedComment { offset: slash })
+}
+
+/// Bit i of the returned mask is set when byte i directly follows an
+/// odd-length run of backslashes, i.e. when byte i is escaped. Ported from
+/// simdjson's `find_odd_backslash_sequences` (carry chains seeded at run
+/// starts with the parity of their position); `ends_odd` carries the pending
+/// parity into the next 64-byte block.
+fn odd_backslash_ends(bs_bits: u64, ends_odd: &mut bool) -> u64 {
+    const EVEN_BITS: u64 = 0x5555_5555_5555_5555;
+    const ODD_BITS: u64 = !EVEN_BITS;
+    let prev = u64::from(*ends_odd);
+    let start_edges = bs_bits & !(bs_bits << 1);
+    // An odd-length run ending the previous block flips which parity of run
+    // start continues the chain at bit 0.
+    let even_start_mask = EVEN_BITS ^ prev;
+    let even_starts = start_edges & even_start_mask;
+    let odd_starts = start_edges & !even_start_mask;
+    let even_carries = bs_bits.wrapping_add(even_starts);
+    let (odd_carries, ends_odd_now) = bs_bits.overflowing_add(odd_starts);
+    let odd_carries = odd_carries | prev;
+    *ends_odd = ends_odd_now;
+    let even_carry_ends = even_carries & !bs_bits;
+    let odd_carry_ends = odd_carries & !bs_bits;
+    (even_carry_ends & ODD_BITS) | (odd_carry_ends & EVEN_BITS)
+}
+
 /// Scalar scan mirroring the canonical stage-1 main loop from byte `i`, with
 /// an `in_token` carry so the SIMD kernels can hand off mid-token-run. When
 /// `in_token` is false the loop body is the canonical decision-point loop.
 #[allow(clippy::cast_possible_truncation)] // guarded by check_input_len
-#[cfg(target_arch = "x86_64")]
 fn scan_scalar(bytes: &[u8], mut i: usize, in_token: bool, index: &mut Vec<u32>) -> Result<()> {
     if in_token {
         // Finish the token run that the vector part started: consume it
@@ -145,596 +559,21 @@ fn scan_scalar(bytes: &[u8], mut i: usize, in_token: bool, index: &mut Vec<u32>)
     Ok(())
 }
 
-/// Dispatch entry for the parser: selects the best backend for the current
-/// CPU.
-///
-/// - x86_64: SSE2 kernel (baseline) or the AVX2 kernel, chosen once per process through a cached
-///   probe.
-/// - other targets: the canonical scalar [`super::stage1::build_index`].
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
-    check_input_len(bytes)?;
-    x86::dispatch(bytes, index)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
-    super::stage1::build_index(bytes, index)
-}
-
-#[cfg(target_arch = "x86_64")]
-mod x86 {
-    use core::arch::x86_64::{
-        __m128i, __m256i, _mm_cmpeq_epi8, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8,
-        _mm_set1_epi8, _mm_xor_si128, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
-        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8, _mm256_setzero_si256,
-        _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_xor_si256,
-    };
-    use std::sync::OnceLock;
-
-    use super::Prims;
-    use crate::Result;
-
-    /// SSE2 block primitives: four 16-byte lanes per 64-byte block. SSE2 is
-    /// baseline on x86_64, so these need no runtime detection.
-    #[derive(Clone, Copy)]
-    pub(crate) struct Sse2;
-
-    // Byte lanes are reinterpreted between u8/i8, and movemask results are
-    // known to fit the low bits; both are lossless in practice.
-    // inline(always) is load-bearing: it folds the primitives into the
-    // #[target_feature] kernel that enables the ISA, so no generic copy is
-    // ever compiled or called without the feature.
-    #[allow(
-        clippy::inline_always,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
-    impl Prims for Sse2 {
-        type Block = [__m128i; 4];
-
-        #[inline(always)]
-        #[allow(clippy::cast_ptr_alignment)] // loadu needs no alignment
-        unsafe fn load64(bytes: &[u8], i: usize) -> Self::Block {
-            // SAFETY: the caller (scan loop) guarantees 64 readable bytes at
-            // `i`; loadu imposes no alignment requirement.
-            unsafe {
-                let p = bytes.as_ptr().add(i).cast::<__m128i>();
-                [
-                    _mm_loadu_si128(p),
-                    _mm_loadu_si128(p.add(1)),
-                    _mm_loadu_si128(p.add(2)),
-                    _mm_loadu_si128(p.add(3)),
-                ]
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn eq_mask(block: Self::Block, byte: u8) -> u64 {
-            // SAFETY: register-only intrinsics; SSE2 is x86_64 baseline.
-            unsafe {
-                let needle = _mm_set1_epi8(byte as i8);
-                let m = |v: __m128i| u64::from(_mm_movemask_epi8(_mm_cmpeq_epi8(v, needle)) as u32);
-                m(block[0]) | (m(block[1]) << 16) | (m(block[2]) << 32) | (m(block[3]) << 48)
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn le_mask(block: Self::Block, bound: u8) -> u64 {
-            // SAFETY: register-only intrinsics; SSE2 is x86_64 baseline.
-            unsafe {
-                // SSE2 byte comparison is signed and core::arch exposes only
-                // the strict forms, so unsigned <= is built from signed > on
-                // sign-flipped operands plus a bitwise NOT: v <= b is
-                // !(v > b).
-                let flip = _mm_set1_epi8(-128);
-                let needle = _mm_set1_epi8((bound ^ 0x80) as i8);
-                let m = |v: __m128i| {
-                    _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_xor_si128(v, flip), needle)) as u32
-                };
-                let gt = u64::from(m(block[0]))
-                    | (u64::from(m(block[1])) << 16)
-                    | (u64::from(m(block[2])) << 32)
-                    | (u64::from(m(block[3])) << 48);
-                !gt
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn token_mask(block: Self::Block) -> u64 {
-            // SAFETY: register-only intrinsics; SSE2 is x86_64 baseline.
-            unsafe {
-                // Token set: [0-9] [A-Z] [a-z] $ _ + - . \ (see CLASSES).
-                let dig = Self::le_mask(block, b'9') & !Self::le_mask(block, b'/');
-                let upper = Self::le_mask(block, b'Z') & !Self::le_mask(block, b'@');
-                let lower = Self::le_mask(block, b'z') & !Self::le_mask(block, b'`');
-                let extra = Self::eq_mask(block, b'$')
-                    | Self::eq_mask(block, b'_')
-                    | Self::eq_mask(block, b'+')
-                    | Self::eq_mask(block, b'-')
-                    | Self::eq_mask(block, b'.')
-                    | Self::eq_mask(block, b'\\');
-                dig | upper | lower | extra
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn structural_mask(block: Self::Block) -> u64 {
-            // SAFETY: register-only intrinsics; SSE2 is x86_64 baseline.
-            unsafe {
-                // No range trick here: 0x5C ('') and 0x7C ('|') sit inside
-                // the bracket ranges but are not structural.
-                Self::eq_mask(block, b'{')
-                    | Self::eq_mask(block, b'}')
-                    | Self::eq_mask(block, b'[')
-                    | Self::eq_mask(block, b']')
-                    | Self::eq_mask(block, b',')
-                    | Self::eq_mask(block, b':')
-            }
-        }
-    }
-
-    /// Append structural offsets for `bytes` to `index` (SSE2 kernel).
-    ///
-    /// # Safety
-    ///
-    /// No preconditions: SSE2 is part of the x86_64 baseline. The input must
-    /// fit in `u32` offsets (see [`super::check_input_len`]).
-    #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn build_index_sse2(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
-        // SAFETY: SSE2 is the x86_64 baseline ISA.
-        unsafe { super::scan_simd::<Sse2>(bytes, index) }
-    }
-
-    /// AVX2 block primitives: two 32-byte lanes per 64-byte block. Only
-    /// reachable after a successful runtime AVX2 detection.
-    #[derive(Clone, Copy)]
-    pub(crate) struct Avx2;
-
-    // See the Sse2 impl for the allow rationale.
-    #[allow(
-        clippy::inline_always,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
-    impl Prims for Avx2 {
-        type Block = [__m256i; 2];
-
-        #[inline(always)]
-        #[allow(clippy::cast_ptr_alignment)] // loadu needs no alignment
-        unsafe fn load64(bytes: &[u8], i: usize) -> Self::Block {
-            // SAFETY: the caller (scan loop) guarantees 64 readable bytes at
-            // `i`; loadu imposes no alignment requirement.
-            unsafe {
-                let p = bytes.as_ptr().add(i).cast::<__m256i>();
-                [_mm256_loadu_si256(p), _mm256_loadu_si256(p.add(1))]
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn eq_mask(block: Self::Block, byte: u8) -> u64 {
-            // SAFETY: register-only intrinsics; the enabling kernel runs only
-            // after a successful AVX2 detection.
-            unsafe {
-                let needle = _mm256_set1_epi8(byte as i8);
-                let m = |v: __m256i| {
-                    u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle)) as u32)
-                };
-                m(block[0]) | (m(block[1]) << 32)
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn le_mask(block: Self::Block, bound: u8) -> u64 {
-            // SAFETY: register-only intrinsics; the enabling kernel runs only
-            // after a successful AVX2 detection.
-            unsafe {
-                // Same sign-flip trick as the SSE2 version: unsigned <= is
-                // !(signed >) on flipped operands.
-                let flip = _mm256_set1_epi8(-128);
-                let needle = _mm256_set1_epi8((bound ^ 0x80) as i8);
-                let m = |v: __m256i| {
-                    _mm256_movemask_epi8(_mm256_cmpgt_epi8(_mm256_xor_si256(v, flip), needle))
-                        as u32
-                };
-                let gt = u64::from(m(block[0])) | (u64::from(m(block[1])) << 32);
-                !gt
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn token_mask(block: Self::Block) -> u64 {
-            // SAFETY: register-only intrinsics; the enabling kernel runs only
-            // after a successful AVX2 detection.
-            unsafe {
-                // Same token set as the SSE2 impl (see CLASSES).
-                let dig = Self::le_mask(block, b'9') & !Self::le_mask(block, b'/');
-                let upper = Self::le_mask(block, b'Z') & !Self::le_mask(block, b'@');
-                let lower = Self::le_mask(block, b'z') & !Self::le_mask(block, b'`');
-                let extra = Self::eq_mask(block, b'$')
-                    | Self::eq_mask(block, b'_')
-                    | Self::eq_mask(block, b'+')
-                    | Self::eq_mask(block, b'-')
-                    | Self::eq_mask(block, b'.')
-                    | Self::eq_mask(block, b'\\');
-                dig | upper | lower | extra
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn structural_mask(block: Self::Block) -> u64 {
-            // SAFETY: register-only intrinsics; the enabling kernel runs only
-            // after a successful AVX2 detection.
-            unsafe {
-                // Same byte set as the SSE2 impl (see CLASSES).
-                Self::eq_mask(block, b'{')
-                    | Self::eq_mask(block, b'}')
-                    | Self::eq_mask(block, b'[')
-                    | Self::eq_mask(block, b']')
-                    | Self::eq_mask(block, b',')
-                    | Self::eq_mask(block, b':')
-            }
-        }
-
-        /// Nibble-table classification (the simdjson scheme): one shuffle per
-        /// nibble replaces the 4 range + 13 eq compare chains, producing all
-        /// three masks in a handful of vector ops per 32-byte lane.
-        ///
-        /// Whitespace uses a self-match table: the entry a byte's low nibble
-        /// selects equals the byte itself exactly for the six whitespace
-        /// bytes (every filler value's own low nibble differs from its index,
-        /// so it can never compare equal); bytes `>= 0x80` shuffle to zero.
-        /// simdjson's table extended with VT (`0x0B`) and FF (`0x0C`) for
-        /// JSON5.
-        ///
-        /// Token and structural bytes come from two rectangle tables: each
-        /// bit b below owns one rectangle `H_b x L_b` (high-nibble set times
-        /// low-nibble set) of the target byte sets, and a byte's class is the
-        /// AND of the bits its two nibbles select:
-        ///
-        /// ```text
-        /// bit 0: h{2}   x l{4,B,D,E}    $ + - .
-        /// bit 1: h{3}   x l{0-9}        0-9
-        /// bit 2: h{4,6} x l{1-F}        A-O, a-o
-        /// bit 3: h{5}   x l{0-A,C,F}    P-Z, backslash, _
-        /// bit 4: h{7}   x l{0-A}        p-z
-        /// bit 5: h{5,7} x l{B,D}        [ ] { }
-        /// bit 6: h{2}   x l{C}          ,
-        /// bit 7: h{3}   x l{A}          :
-        /// ```
-        ///
-        /// Bits 0-4 mark token rectangles and bits 5-7 structural ones, so a
-        /// nonzero low-half byte means token and a nonzero top-three-bits
-        /// byte means structural. The rectangles are exact products, and the
-        /// 256-value exhaustive test below pins the tables to `CLASSES`.
-        #[inline(always)]
-        unsafe fn classify(block: Self::Block) -> (u64, u64, u64) {
-            static WS_LUT: [u8; 32] = [
-                0x20, 100, 100, 100, 17, 100, 113, 2, 100, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 100, 100,
-                0x20, 100, 100, 100, 17, 100, 113, 2, 100, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 100, 100,
-            ];
-            static LO_LUT: [u8; 32] = [
-                0x1a, 0x1e, 0x1e, 0x1e, 0x1f, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x9c, 0x25, 0x4c, 0x25,
-                0x05, 0x0c, 0x1a, 0x1e, 0x1e, 0x1e, 0x1f, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x9c, 0x25,
-                0x4c, 0x25, 0x05, 0x0c,
-            ];
-            static HI_LUT: [u8; 32] = [
-                0x00, 0x00, 0x41, 0x82, 0x04, 0x28, 0x04, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x41, 0x82, 0x04, 0x28, 0x04, 0x30, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-            ];
-            // SAFETY: register-only intrinsics except the three table loads,
-            // which are in-bounds 32-byte reads of immutable statics; the
-            // enabling kernel runs only after a successful AVX2 detection.
-            unsafe {
-                // SAFETY: in-bounds statics, as above.
-                let ws_lut = _mm256_loadu_si256(WS_LUT.as_ptr().cast());
-                let lo_lut = _mm256_loadu_si256(LO_LUT.as_ptr().cast());
-                let hi_lut = _mm256_loadu_si256(HI_LUT.as_ptr().cast());
-                let nibble = _mm256_set1_epi8(0x0f);
-                let tok_bits = _mm256_set1_epi8(0x1f);
-                let special_bits = _mm256_set1_epi8(0x07);
-                let zero = _mm256_setzero_si256();
-                let m = |v: __m256i| u64::from(_mm256_movemask_epi8(v) as u32);
-                let mut ws = 0_u64;
-                let mut tok = 0_u64;
-                let mut special = 0_u64;
-                for (i, v) in block.iter().enumerate() {
-                    let shift = 32 * i;
-                    // pshufb indexes by the low 4 bits, so the low-nibble
-                    // lookups need no masking.
-                    ws |= m(_mm256_cmpeq_epi8(*v, _mm256_shuffle_epi8(ws_lut, *v))) << shift;
-                    let cls = _mm256_and_si256(
-                        _mm256_shuffle_epi8(lo_lut, *v),
-                        _mm256_shuffle_epi8(
-                            hi_lut,
-                            _mm256_and_si256(_mm256_srli_epi16(*v, 4), nibble),
-                        ),
-                    );
-                    tok |= m(_mm256_cmpgt_epi8(_mm256_and_si256(cls, tok_bits), zero)) << shift;
-                    special |= m(_mm256_cmpgt_epi8(
-                        _mm256_and_si256(_mm256_srli_epi16(cls, 5), special_bits),
-                        zero,
-                    )) << shift;
-                }
-                (ws, tok, special)
-            }
-        }
-    }
-
-    /// Append structural offsets for `bytes` to `index` (AVX2 kernel).
-    ///
-    /// # Safety
-    ///
-    /// AVX2 must be available on the CPU; the cached dispatch below selects
-    /// this kernel only after a successful detection. The input must fit in
-    /// `u32` offsets (see [`super::check_input_len`]).
-    #[target_feature(enable = "avx2")]
-    pub(crate) unsafe fn build_index_avx2(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
-        // SAFETY: the caller (dispatch) guarantees AVX2 support.
-        unsafe { super::scan_simd::<Avx2>(bytes, index) }
-    }
-
-    /// Cached runtime dispatch. The CPU probe runs exactly once per process;
-    /// a repeated `is_x86_feature_detected!` on the hot path would cost far
-    /// more than the dispatch itself.
-    type Kernel = unsafe fn(&[u8], &mut Vec<u32>) -> Result<()>;
-
-    static KERNEL: OnceLock<Kernel> = OnceLock::new();
-
-    pub(super) fn dispatch(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
-        let kernel = *KERNEL.get_or_init(|| {
-            if std::is_x86_feature_detected!("avx2") {
-                build_index_avx2
-            } else {
-                build_index_sse2
-            }
-        });
-        // SAFETY: SSE2 is baseline on x86_64; the AVX2 kernel is selected
-        // only after a successful feature detection.
-        unsafe { kernel(bytes, index) }
-    }
-}
-
-/// Bit i of the returned mask is set when byte i directly follows an
-/// odd-length run of backslashes, i.e. when byte i is escaped. Ported from
-/// simdjson's `find_odd_backslash_sequences` (carry chains seeded at run
-/// starts with the parity of their position); `ends_odd` carries the pending
-/// parity into the next 64-byte block.
-#[cfg(target_arch = "x86_64")]
-fn odd_backslash_ends(bs_bits: u64, ends_odd: &mut bool) -> u64 {
-    const EVEN_BITS: u64 = 0x5555_5555_5555_5555;
-    const ODD_BITS: u64 = !EVEN_BITS;
-    let prev = u64::from(*ends_odd);
-    let start_edges = bs_bits & !(bs_bits << 1);
-    // An odd-length run ending the previous block flips which parity of run
-    // start continues the chain at bit 0.
-    let even_start_mask = EVEN_BITS ^ prev;
-    let even_starts = start_edges & even_start_mask;
-    let odd_starts = start_edges & !even_start_mask;
-    let even_carries = bs_bits.wrapping_add(even_starts);
-    let (odd_carries, ends_odd_now) = bs_bits.overflowing_add(odd_starts);
-    let odd_carries = odd_carries | prev;
-    *ends_odd = ends_odd_now;
-    let even_carry_ends = even_carries & !bs_bits;
-    let odd_carry_ends = odd_carries & !bs_bits;
-    (even_carry_ends & ODD_BITS) | (odd_carry_ends & EVEN_BITS)
-}
-
-/// Vector block primitives for one 64-byte step of the scan. All methods are
-/// `#[inline(always)]` so the generic scan folds into the
-/// `#[target_feature]` kernel that enables the ISA.
-#[cfg(target_arch = "x86_64")]
-trait Prims {
-    type Block: Copy;
-
-    /// Load 64 bytes at `i`.
-    ///
-    /// # Safety
-    ///
-    /// `i + 64 <= bytes.len()` must hold, and the enabling ISA of the calling
-    /// kernel must be available on the CPU.
-    unsafe fn load64(bytes: &[u8], i: usize) -> Self::Block;
-
-    /// Mask of bytes equal to `byte`.
-    ///
-    /// # Safety
-    ///
-    /// The enabling ISA of the calling kernel must be available.
-    unsafe fn eq_mask(block: Self::Block, byte: u8) -> u64;
-
-    /// Mask of bytes whose unsigned value is `<= bound`.
-    ///
-    /// # Safety
-    ///
-    /// The enabling ISA of the calling kernel must be available.
-    unsafe fn le_mask(block: Self::Block, bound: u8) -> u64;
-
-    /// Mask of stage-1 token bytes (`CLASSES[..] & class::TOKEN`): identifier
-    /// characters, number characters and the backslash.
-    ///
-    /// # Safety
-    ///
-    /// The enabling ISA of the calling kernel must be available.
-    unsafe fn token_mask(block: Self::Block) -> u64;
-
-    /// Mask of structural bytes (`CLASSES[..] & class::STRUCTURAL`):
-    /// `{` `}` `[` `]` `,` `:`.
-    ///
-    /// # Safety
-    ///
-    /// The enabling ISA of the calling kernel must be available.
-    unsafe fn structural_mask(block: Self::Block) -> u64;
-
-    /// Classify a block in one step: `(whitespace, token, structural)` masks,
-    /// where whitespace is exactly `0x09..=0x0D` and `0x20`. The default
-    /// composes the mask primitives above; backends with a cheaper scheme
-    /// (a nibble-table lookup, when the ISA has a byte shuffle) override it.
-    ///
-    /// # Safety
-    ///
-    /// The enabling ISA of the calling kernel must be available.
-    #[inline(always)]
-    #[allow(clippy::inline_always)] // load-bearing, see the Prims impls
-    unsafe fn classify(block: Self::Block) -> (u64, u64, u64) {
-        // SAFETY: caller guarantees the enabling ISA.
-        unsafe {
-            let ws = (Self::le_mask(block, 0x0d) & !Self::le_mask(block, 0x08))
-                | Self::eq_mask(block, b' ');
-            (ws, Self::token_mask(block), Self::structural_mask(block))
-        }
-    }
-}
-
-/// Vectorized string skip: returns the position just past the closing quote
-/// of the string opened at `open`, or the canonical unterminated error.
-///
-/// # Safety
-///
-/// The enabling ISA of `O` must be available on the CPU.
-#[cfg(target_arch = "x86_64")]
-unsafe fn skip_string_simd<O: Prims>(bytes: &[u8], open: usize) -> Result<usize> {
-    let quote = bytes[open];
-    let len = bytes.len();
-    let mut i = open + 1;
-    let mut ends_odd = false;
-    while i + 64 <= len {
-        // SAFETY: loop guard bounds the load; ISA per the function contract.
-        let block = unsafe { O::load64(bytes, i) };
-        // SAFETY: register-only primitive ops.
-        let bs = unsafe { O::eq_mask(block, b'\\') };
-        let quotes = unsafe { O::eq_mask(block, quote) };
-        // A quote closes the string only when not escaped. With no
-        // backslashes in the block the parity chain degenerates: the only
-        // escape shadow is the carry-in on byte 0, and the carry always ends
-        // here (matches odd_backslash_ends on a zero mask), so the ~10-op
-        // chain is skipped for the common backslash-free block.
-        let closers = if bs == 0 {
-            let carried = u64::from(ends_odd);
-            ends_odd = false;
-            quotes & !carried
-        } else {
-            quotes & !odd_backslash_ends(bs, &mut ends_odd)
-        };
-        if closers != 0 {
-            return Ok(i + closers.trailing_zeros() as usize + 1);
-        }
-        i += 64;
-    }
-    // Scalar tail, carrying the pending escape parity.
-    skip_string_tail(bytes, open, i, ends_odd)
-}
-
-/// Vectorized comment skip mirroring [`skip_comment`].
-///
-/// # Safety
-///
-/// The enabling ISA of `O` must be available on the CPU.
-#[cfg(target_arch = "x86_64")]
-unsafe fn skip_comment_simd<O: Prims>(bytes: &[u8], slash: usize) -> Result<usize> {
-    match bytes.get(slash + 1) {
-        // SAFETY: same ISA as the calling kernel.
-        Some(b'/') => Ok(unsafe { skip_line_simd::<O>(bytes, slash + 2) }),
-        // SAFETY: same ISA as the calling kernel.
-        Some(b'*') => unsafe { skip_block_simd::<O>(bytes, slash) },
-        _ => Err(Error::UnexpectedChar {
-            byte: b'/',
-            offset: slash,
-        }),
-    }
-}
-
-/// Line comment: position just past the next `\n`, or the end of input.
-///
-/// # Safety
-///
-/// The enabling ISA of `O` must be available on the CPU.
-#[cfg(target_arch = "x86_64")]
-unsafe fn skip_line_simd<O: Prims>(bytes: &[u8], from: usize) -> usize {
-    let len = bytes.len();
-    let mut i = from;
-    while i + 64 <= len {
-        // SAFETY: loop guard bounds the load; ISA per the function contract.
-        let lf = unsafe { O::eq_mask(O::load64(bytes, i), b'\n') };
-        if lf != 0 {
-            return i + lf.trailing_zeros() as usize + 1;
-        }
-        i += 64;
-    }
-    match bytes[i..].iter().position(|&b| b == b'\n') {
-        Some(nl) => i + nl + 1,
-        None => len,
-    }
-}
-
-/// Block comment: position just past the first `*/`, or the canonical
-/// unterminated error.
-///
-/// # Safety
-///
-/// The enabling ISA of `O` must be available on the CPU.
-#[cfg(target_arch = "x86_64")]
-unsafe fn skip_block_simd<O: Prims>(bytes: &[u8], slash: usize) -> Result<usize> {
-    let len = bytes.len();
-    let mut i = slash + 2;
-    // Set when byte `i - 1` is `*` (a `*/` may straddle a block boundary).
-    let mut prev_star = false;
-    while i + 64 <= len {
-        // SAFETY: loop guard bounds the load; ISA per the function contract.
-        let block = unsafe { O::load64(bytes, i) };
-        // SAFETY: register-only primitive ops.
-        let stars = unsafe { O::eq_mask(block, b'*') };
-        let slashes = unsafe { O::eq_mask(block, b'/') };
-        let mut closers = (stars << 1) & slashes;
-        if prev_star && slashes & 1 != 0 {
-            closers |= 1;
-        }
-        if closers != 0 {
-            return Ok(i + closers.trailing_zeros() as usize + 1);
-        }
-        prev_star = stars >> 63 != 0;
-        i += 64;
-    }
-    // Scalar tail; `prev_star` carries the boundary-straddling `*`.
-    while i < len {
-        if prev_star && bytes[i] == b'/' {
-            return Ok(i + 1);
-        }
-        prev_star = bytes[i] == b'*';
-        i += 1;
-    }
-    Err(Error::UnterminatedComment { offset: slash })
-}
-
-/// Generic 64-byte-block scan; the kernel entry points monomorphize this for
-/// each ISA. Everything is `#[inline(always)]` down to the primitives, so the
-/// whole body code-gens inside the `#[target_feature]` kernel.
-///
-/// # Safety
-///
-/// The enabling ISA of `O` must be available on the CPU, and the input must
-/// fit in `u32` offsets (see [`check_input_len`]).
-#[cfg(target_arch = "x86_64")]
-#[allow(clippy::cast_possible_truncation)]
-// guarded by check_input_len
-// inline(always) is load-bearing here (see the Prims impls): the generic
-// body must fold into the #[target_feature] kernel of each backend.
-#[allow(clippy::inline_always)]
+/// Generic 64-byte-block scan; `dispatch!` monomorphizes this for each ISA
+/// inside a feature-enabled closure, so the whole body (and everything it
+/// calls) must fold in through `#[inline(always)]`.
+#[allow(clippy::cast_possible_truncation)] // guarded by check_input_len
 #[inline(always)]
-unsafe fn scan_simd<O: Prims>(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+fn scan_simd<S: Simd>(simd: S, bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
     debug_assert!(u32::try_from(bytes.len()).is_ok());
     let len = bytes.len();
     let mut pos = 0usize;
     // True when the previous byte outside strings/comments was a token byte,
     // so the byte at `pos` continues a token run instead of starting one.
     let mut in_token = false;
+    let classifier = classifier(simd);
     'blocks: while pos + 64 <= len {
-        // SAFETY: loop guard guarantees 64 readable bytes at `pos`.
-        let block = unsafe { O::load64(bytes, pos) };
-        // SAFETY: register-only primitive ops. Whitespace is exactly
-        // 0x09..=0x0D and 0x20; tok and special are the stage-1 token and
-        // structural byte sets (see CLASSES).
-        let (ws, tok, special) = unsafe { O::classify(block) };
+        let (ws, tok, special) = classify_with(classifier, bytes, pos);
         let mut attn = !ws; // attention bits: every non-whitespace byte
         let block_end = pos + 64;
         if attn != 0 {
@@ -799,13 +638,11 @@ unsafe fn scan_simd<O: Prims>(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> 
                     b'"' | b'\'' => {
                         index.push(p as u32);
                         in_token = false;
-                        // SAFETY: same ISA as this kernel.
-                        unsafe { skip_string_simd::<O>(bytes, p) }?
+                        skip_string_simd(simd, bytes, p)?
                     },
                     b'/' => {
                         in_token = false;
-                        // SAFETY: same ISA as this kernel.
-                        unsafe { skip_comment_simd::<O>(bytes, p) }?
+                        skip_comment_simd(simd, bytes, p)?
                     },
                     0x09..=0x0d | b' ' => {
                         // Only reachable if the vector whitespace mask
@@ -879,26 +716,84 @@ mod tests {
     // Hand-written expected offsets are tiny and cannot truncate.
     #![allow(clippy::cast_possible_truncation)]
 
+    #[cfg(target_arch = "aarch64")]
+    use fearless_simd::Neon;
+    #[cfg(target_arch = "x86_64")]
+    use fearless_simd::{Avx2, Sse2, Sse4_2};
+
     use super::*;
     use crate::parser::stage1;
 
-    type KernelFn = unsafe fn(&[u8], &mut Vec<u32>) -> Result<()>;
+    type KernelFn = fn(&[u8], &mut Vec<u32>) -> Result<()>;
+
+    /// Per level: classification masks from every strategy.
+    type Strategies = Vec<(&'static str, (u64, u64, u64))>;
+
+    fn scan_fallback(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+        dispatch!(Level::fallback(), simd => scan_simd(simd, bytes, index))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn scan_sse2(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+        // SAFETY: SSE2 (with sse/fxsr) is the x86_64 baseline.
+        dispatch!(Level::Sse2(unsafe { Sse2::assume_supported() }), simd => scan_simd(simd, bytes, index))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn scan_sse4_2(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+        // SAFETY: pushed into `kernels()` only after detecting every feature
+        // this token requires.
+        dispatch!(Level::Sse4_2(unsafe { Sse4_2::assume_supported() }), simd => scan_simd(simd, bytes, index))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn scan_avx2(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+        // SAFETY: pushed into `kernels()` only after detecting every feature
+        // this token requires.
+        dispatch!(Level::Avx2(unsafe { Avx2::assume_supported() }), simd => scan_simd(simd, bytes, index))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn scan_neon(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+        // SAFETY: NEON is the aarch64 baseline.
+        dispatch!(Level::Neon(unsafe { Neon::assume_supported() }), simd => scan_simd(simd, bytes, index))
+    }
+
+    fn scan_dispatched(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+        build_index(bytes, index)
+    }
 
     /// All kernels available on this machine, including the dispatch entry.
     fn kernels() -> Vec<(&'static str, KernelFn)> {
+        let mut kernels: Vec<(&'static str, KernelFn)> = vec![("fallback", scan_fallback)];
         #[cfg(target_arch = "x86_64")]
         {
-            let mut kernels: Vec<(&'static str, KernelFn)> = vec![("sse2", x86::build_index_sse2)];
-            if std::is_x86_feature_detected!("avx2") {
-                kernels.push(("avx2", x86::build_index_avx2));
+            kernels.push(("sse2", scan_sse2));
+            // Feature sets must match each token's `assume_supported` contract.
+            let sse4_2 = std::is_x86_feature_detected!("sse4.2")
+                && std::is_x86_feature_detected!("cmpxchg16b")
+                && std::is_x86_feature_detected!("popcnt");
+            if sse4_2 {
+                kernels.push(("sse4.2", scan_sse4_2));
             }
-            kernels.push(("dispatch", build_index));
-            kernels
+            let avx2 = std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("bmi1")
+                && std::is_x86_feature_detected!("bmi2")
+                && std::is_x86_feature_detected!("cmpxchg16b")
+                && std::is_x86_feature_detected!("f16c")
+                && std::is_x86_feature_detected!("fma")
+                && std::is_x86_feature_detected!("lzcnt")
+                && std::is_x86_feature_detected!("movbe")
+                && std::is_x86_feature_detected!("popcnt")
+                && std::is_x86_feature_detected!("xsave");
+            if avx2 {
+                kernels.push(("avx2", scan_avx2));
+            }
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            vec![("scalar", build_index)]
-        }
+        #[cfg(target_arch = "aarch64")]
+        kernels.push(("neon", scan_neon));
+        kernels.push(("dispatch", scan_dispatched));
+        kernels
     }
 
     /// The core differential: every kernel must agree with the canonical
@@ -909,8 +804,7 @@ mod tests {
         let expected = stage1::build_index(bytes, &mut oracle);
         for (label, kernel) in kernels() {
             let mut got = Vec::new();
-            // SAFETY: x86_64 kernels are baseline-or-detected for this CPU.
-            let result = unsafe { kernel(bytes, &mut got) };
+            let result = kernel(bytes, &mut got);
             assert!(
                 result == expected,
                 "{label}: result {result:?} != oracle {expected:?} for {bytes:02x?}"
@@ -1425,84 +1319,104 @@ mod tests {
         differential(&tok2);
     }
 
-    /// Exhaustive: every kernel's `token_mask` / `structural_mask` /
-    /// `classify` must agree with the scalar `CLASSES` byte table (and the
-    /// exact whitespace set) for all 256 byte values (4 blocks of 64). This
-    /// is what catches lookalike bytes inside range tricks (0x5C inside
-    /// `[`..`]`, 0x7C inside `{`..=`}`) and nibble-table mistakes.
+    /// Exhaustive: every level's classification, both compare-chain and
+    /// nibble-table strategy, must agree with the scalar `CLASSES` byte table
+    /// (and the exact whitespace set) for all 256 byte values (4 blocks of
+    /// 64). This is what catches lookalike bytes inside range tricks (0x5C
+    /// inside `[`..`]`, 0x7C inside `{`..=`}`) and nibble-table mistakes,
+    /// including on emulated-shuffle levels where the table path is unused.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn masks_match_class_table() {
         let mut bytes = [0_u8; 256];
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = i as u8;
         }
-        for start in (0..256).step_by(64) {
-            let ws_of = |b: usize| matches!(b, 0x09..=0x0d | 0x20);
-            // SAFETY: SSE2 is the x86_64 baseline.
-            let sse_block = unsafe { x86::Sse2::load64(&bytes, start) };
-            // SAFETY: as above.
-            let mut masks = vec![(
-                "sse2",
-                // SAFETY: as above.
-                unsafe { x86::Sse2::token_mask(sse_block) },
-                unsafe { x86::Sse2::structural_mask(sse_block) },
-                // SAFETY: as above.
-                unsafe { x86::Sse2::classify(sse_block) },
-            )];
-            if std::is_x86_feature_detected!("avx2") {
-                // SAFETY: guarded by the feature detection above.
-                let block = unsafe { x86::Avx2::load64(&bytes, start) };
-                masks.push((
-                    "avx2",
-                    // SAFETY: guarded by the feature detection above.
-                    unsafe { x86::Avx2::token_mask(block) },
-                    unsafe { x86::Avx2::structural_mask(block) },
-                    // SAFETY: guarded by the feature detection above.
-                    unsafe { x86::Avx2::classify(block) },
-                ));
+        let ws_of = |b: usize| matches!(b, 0x09..=0x0d | 0x20);
+
+        let mut levels: Vec<(&'static str, Strategies)> = Vec::new();
+        let mut push = |label: &'static str, strategies: Strategies| {
+            levels.push((label, strategies));
+        };
+        macro_rules! level {
+            ($label:literal, $level:expr) => {
+                dispatch!($level, simd => {
+                    let blocks = load64(simd, &bytes, 0);
+                    push($label, vec![
+                        ("dispatched", classify_with(classifier(simd), &bytes, 0)),
+                        ("compares", classify_compares(simd, blocks)),
+                        ("tables", classify_tables(simd, blocks)),
+                    ]);
+                });
+            };
+        }
+        level!("fallback", Level::fallback());
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: SSE2 (with sse/fxsr) is the x86_64 baseline.
+            level!("sse2", Level::Sse2(unsafe { Sse2::assume_supported() }));
+            // SAFETY: detected alongside every required feature.
+            if std::is_x86_feature_detected!("sse4.2")
+                && std::is_x86_feature_detected!("cmpxchg16b")
+                && std::is_x86_feature_detected!("popcnt")
+            {
+                level!(
+                    "sse4.2",
+                    Level::Sse4_2(unsafe { Sse4_2::assume_supported() })
+                );
             }
-            for (label, tok, special, cls) in masks {
-                for i in 0..64 {
-                    let b = start + i;
-                    assert_eq!(
-                        tok & (1 << i) != 0,
-                        CLASSES[b] & class::TOKEN != 0,
-                        "{label} token: byte {b:#04x}"
-                    );
-                    assert_eq!(
-                        special & (1 << i) != 0,
-                        CLASSES[b] & class::STRUCTURAL != 0,
-                        "{label} structural: byte {b:#04x}"
-                    );
-                    let (cws, ctok, cspecial) = cls;
-                    assert_eq!(
-                        cws & (1 << i) != 0,
-                        ws_of(b),
-                        "{label} classify ws: byte {b:#04x}"
-                    );
-                    assert_eq!(
-                        ctok & (1 << i) != 0,
-                        CLASSES[b] & class::TOKEN != 0,
-                        "{label} classify token: byte {b:#04x}"
-                    );
-                    assert_eq!(
-                        cspecial & (1 << i) != 0,
-                        CLASSES[b] & class::STRUCTURAL != 0,
-                        "{label} classify structural: byte {b:#04x}"
-                    );
+            // SAFETY: detected alongside every required feature.
+            if std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("bmi1")
+                && std::is_x86_feature_detected!("bmi2")
+                && std::is_x86_feature_detected!("cmpxchg16b")
+                && std::is_x86_feature_detected!("f16c")
+                && std::is_x86_feature_detected!("fma")
+                && std::is_x86_feature_detected!("lzcnt")
+                && std::is_x86_feature_detected!("movbe")
+                && std::is_x86_feature_detected!("popcnt")
+                && std::is_x86_feature_detected!("xsave")
+            {
+                level!("avx2", Level::Avx2(unsafe { Avx2::assume_supported() }));
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: NEON is the aarch64 baseline.
+            level!("neon", Level::Neon(unsafe { Neon::assume_supported() }));
+        }
+
+        for (level_label, strategies) in levels {
+            for (strategy, (ws, tok, special)) in strategies {
+                for lane in 0..4usize {
+                    for i in 0..16usize {
+                        let b = lane * 16 + i;
+                        let bit = 1_u64 << (lane * 16 + i);
+                        assert_eq!(
+                            tok & bit != 0,
+                            CLASSES[b] & class::TOKEN != 0,
+                            "{level_label}/{strategy} token: byte {b:#04x}"
+                        );
+                        assert_eq!(
+                            special & bit != 0,
+                            CLASSES[b] & class::STRUCTURAL != 0,
+                            "{level_label}/{strategy} structural: byte {b:#04x}"
+                        );
+                        assert_eq!(
+                            ws & bit != 0,
+                            ws_of(b),
+                            "{level_label}/{strategy} ws: byte {b:#04x}"
+                        );
+                    }
                 }
             }
         }
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn kernel_availability_report() {
         // Informational: which kernels this machine verifies. Run with
         // `--no-capture` to see it.
-        let avx2 = std::is_x86_feature_detected!("avx2");
-        println!("avx2 detected: {avx2}");
-        assert!(kernels().iter().any(|(label, _)| *label == "sse2"));
+        println!("level: {:?}", Level::new());
+        assert!(kernels().iter().any(|(label, _)| *label == "fallback"));
     }
 }
