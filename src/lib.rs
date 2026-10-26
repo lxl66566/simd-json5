@@ -38,7 +38,7 @@ pub fn from_str(s: &str) -> Result<Value<'_>> {
 
 /// Parse a JSON5 document from raw bytes; fails if `v` is not valid UTF-8.
 pub fn from_slice(v: &[u8]) -> Result<Value<'_>> {
-    let s = core::str::from_utf8(v).map_err(|e| Error::InvalidUtf8 {
+    let s = simdutf8::compat::from_utf8(v).map_err(|e| Error::InvalidUtf8 {
         offset: e.valid_up_to(),
     })?;
     parser::parse(s.as_bytes())

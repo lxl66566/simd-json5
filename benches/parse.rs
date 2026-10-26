@@ -65,6 +65,19 @@ fn bench_json5(c: &mut Criterion) {
     group.finish();
 }
 
+/// `from_slice` adds whole-input UTF-8 validation on top of `from_str`.
+fn bench_slice(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse/slice");
+    group.sample_size(100);
+    for name in JSON_CORPORA {
+        let bytes = corpus(name).into_bytes();
+        group.bench_function(format!("{name}/simd-json5"), |b| {
+            b.iter(|| black_box(simd_json5::from_slice(black_box(&bytes)).unwrap()));
+        });
+    }
+    group.finish();
+}
+
 /// Typed (serde) parsing: our serde layer into a zero-copy `Value` DOM
 /// against `serde_json`'s `Value`. The DOM `from_str` group above shows the
 /// serde-layer overhead by comparison.
@@ -93,6 +106,7 @@ fn bench_typed(c: &mut Criterion) {
 fn bench_parse(c: &mut Criterion) {
     bench_json(c);
     bench_json5(c);
+    bench_slice(c);
     #[cfg(feature = "serde")]
     bench_typed(c);
 }

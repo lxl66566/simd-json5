@@ -77,7 +77,7 @@ pub fn from_slice<'de, T>(v: &'de [u8]) -> Result<T>
 where
     T: serde::Deserialize<'de>,
 {
-    let s = core::str::from_utf8(v).map_err(|e| Error::InvalidUtf8 {
+    let s = simdutf8::compat::from_utf8(v).map_err(|e| Error::InvalidUtf8 {
         offset: e.valid_up_to(),
     })?;
     from_str(s)

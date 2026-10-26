@@ -744,6 +744,7 @@ dependencies = [
  "serde_json",
  "serde_json5",
  "simd-json",
+ "simdutf8",
  "thiserror",
 ]
 
