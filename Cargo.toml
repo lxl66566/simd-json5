@@ -3,18 +3,19 @@ name         = "simd-json5"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.89"
-description  = "Fastest JSON5 parser and serializer"
+description  = "Fastest JSON5 parser and serializer with serde support"
 repository   = "https://github.com/lxl66566/simd-json5"
 license      = "MIT OR Apache-2.0"
 keywords     = ["json", "json5", "parser", "serde", "simd"]
 categories   = ["encoding", "parser-implementations"]
 include      = [
+  "!**/__pycache__/**",
   "!/benches/data/**",
   "!/benches/results/**",
-  "/CHANGELOG.md",
   "/LICENSE-*",
   "/README.md",
   "/benches/**",
+  "/examples/**",
   "/src/**",
   "/tests/**"
 ]

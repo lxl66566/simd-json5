@@ -226,6 +226,7 @@ impl<W: Sink> Writer<W> {
     /// as `0.10000000149011612`) instead of the shortest f32 one (`0.1`),
     /// diverging from serde_json. Non-finite values keep the f64 literal
     /// handling.
+    #[cfg_attr(not(feature = "serde"), allow(dead_code))]
     fn write_f32(&mut self, n: f32) {
         if n.is_finite() {
             let mut buffer = zmij::Buffer::new();
