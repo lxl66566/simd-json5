@@ -283,8 +283,8 @@ impl<'a> Value<'a> {
 impl<'a> Index<&str> for Value<'a> {
     type Output = Value<'a>;
 
-    /// Missing object members yield `Value::Null`; indexing a non-object with
-    /// a string panics.
+    /// Missing object members and indexing a non-object both yield
+    /// [`Value::Null`].
     fn index(&self, key: &str) -> &Self::Output {
         self.get(key).unwrap_or(&Value::Null)
     }
@@ -293,8 +293,8 @@ impl<'a> Index<&str> for Value<'a> {
 impl<'a> Index<usize> for Value<'a> {
     type Output = Value<'a>;
 
-    /// Out-of-range array indices yield `Value::Null`; indexing a non-array
-    /// with an integer panics.
+    /// Out-of-range array indices and indexing a non-array both yield
+    /// [`Value::Null`].
     fn index(&self, index: usize) -> &Self::Output {
         self.get_index(index).unwrap_or(&Value::Null)
     }
@@ -353,9 +353,11 @@ impl<'a> From<Map<'a>> for Value<'a> {
 // keep it clearly separated from the DOM definition above.
 // ---------------------------------------------------------------------------
 
-/// Compact serialization, identical to [`crate::to_string`].
+/// Compact serialization, identical to [`crate::to_string`], streamed into
+/// the formatter in chunks instead of materializing the whole document in a
+/// temporary `String` first.
 impl fmt::Display for Value<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&crate::ser::to_string(self))
+        crate::ser::write_streaming(self, f)
     }
 }

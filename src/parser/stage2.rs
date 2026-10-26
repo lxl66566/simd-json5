@@ -42,6 +42,9 @@ enum Frame<'a> {
     },
 }
 
+/// Syntax-error constructor. Cold: keeps error paths out of the hot loop's
+/// instruction stream.
+#[cold]
 fn syntax(message: &str, offset: usize) -> Error {
     Error::Syntax {
         message: message.into(),
@@ -50,9 +53,22 @@ fn syntax(message: &str, offset: usize) -> Error {
 }
 
 /// Build a DOM from the structural `index` over `bytes`.
+///
+/// Containers deliberately grow from empty: pre-sizing them from the
+/// [`super::container_counts`] hints was tried in five variants (exact
+/// hints, min-filtered, power-of-two-rounded, threshold-gated, pooled
+/// table) and each one benched DOM citm_catalog 22-27% slower than the
+/// grow path when measured right after another document in the same
+/// process (first-in-process the same builds won 5-15%), while the serde
+/// path using the identical hints and table never showed the effect. The
+/// DOM walk's hot loop is much tighter than the serde machinery; whatever
+/// the microarchitectural interaction is, pre-allocation from hints does
+/// not survive it, so this loop stays allocation-hint-free.
 pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32]) -> Result<Value<'a>> {
     let mut root: Option<Value<'a>> = None;
-    let mut stack: Vec<Frame<'a>> = Vec::new();
+    // Typical documents nest shallower than this; one upfront allocation
+    // covers the whole walk.
+    let mut stack: Vec<Frame<'a>> = Vec::with_capacity(16);
 
     for &entry in index {
         let off = usize::try_from(entry).expect("stage 1 offsets are input positions");
@@ -60,7 +76,12 @@ pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32]) -> Result<Value<'a>> {
         if root.is_some() && stack.is_empty() {
             return Err(Error::TrailingCharacters { offset: off });
         }
-        match bytes[off] {
+        // SAFETY: `off` comes from the stage 1 index built over this same
+        // `bytes`: every entry is a valid input position (< bytes.len()).
+        // `build` is pub(crate) and only called by `parser::parse`, right
+        // after index construction over the same slice.
+        let b = unsafe { *bytes.get_unchecked(off) };
+        match b {
             b'{' | b'[' => {
                 check_value_position(&stack, off)?;
                 if stack.len() >= MAX_DEPTH {
@@ -69,7 +90,7 @@ pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32]) -> Result<Value<'a>> {
                         offset: off,
                     });
                 }
-                stack.push(if bytes[off] == b'[' {
+                stack.push(if b == b'[' {
                     Frame::Array {
                         items: Vec::new(),
                         after_element: false,
@@ -191,7 +212,7 @@ pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32]) -> Result<Value<'a>> {
                 {
                     if *state == ObjState::KeyOrClose {
                         // Unquoted number keys are invalid.
-                        if matches!(bytes[off], b'+' | b'-' | b'.' | b'0'..=b'9') {
+                        if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
                             return Err(syntax("expected identifier or string key", off));
                         }
                         let end = token_end(bytes, off);
@@ -325,7 +346,11 @@ pub(crate) fn token_value(tok: &[u8], off: usize) -> Result<Value<'static>> {
 /// with `[A-Za-z_$]`, a non-ASCII code point or a `\uXXXX` escape; continues
 /// with identifier bytes, non-ASCII code points and more `\uXXXX` escapes.
 pub(crate) fn parse_identifier(bytes: &[u8], off: usize, end: usize) -> Result<Str<'_>> {
+    // Bytes since the end of the previous escape are appended as one raw
+    // segment when the next escape starts, and once more after the loop, so
+    // no segment between or after escapes is dropped.
     let mut out: Option<String> = None;
+    let mut last = off;
     let mut i = off;
     while i < end {
         let b = bytes[i];
@@ -335,8 +360,12 @@ pub(crate) fn parse_identifier(bytes: &[u8], off: usize, end: usize) -> Result<S
                 return Err(Error::InvalidEscape { offset: i });
             }
             let (c, next) = decode_unicode_escape(bytes, i)?;
-            out.get_or_insert_with(|| string_prefix(bytes, off, i))
-                .push(c);
+            // `end - off` is a capacity upper bound: a 6-byte escape decodes
+            // to at most 3 UTF-8 bytes (a surrogate pair: 12 to 4).
+            let o = out.get_or_insert_with(|| String::with_capacity(end - off));
+            o.push_str(str_slice(bytes, last, i));
+            o.push(c);
+            last = next;
             i = next;
         } else if b < 0x80 {
             if CLASSES[b as usize] & class::IDENT == 0 {
@@ -350,22 +379,16 @@ pub(crate) fn parse_identifier(bytes: &[u8], off: usize, end: usize) -> Result<S
             if is_unicode_whitespace(cp) {
                 return Err(Error::UnexpectedChar { byte: b, offset: i });
             }
-            if let Some(o) = out.as_mut() {
-                o.push_str(str_slice(bytes, i, i + len)?);
-            }
             i += len;
         }
     }
+    if let Some(o) = out.as_mut() {
+        o.push_str(str_slice(bytes, last, end));
+    }
     Ok(match out {
         Some(o) => Str::Dynamic(o),
-        None => Str::Static(str_slice(bytes, off, end)?),
+        None => Str::Static(str_slice(bytes, off, end)),
     })
-}
-
-/// Owned copy of the raw token prefix before its first escape. The prefix is
-/// valid UTF-8 without line terminators (the scanner rejects those first).
-fn string_prefix(bytes: &[u8], from: usize, upto: usize) -> String {
-    String::from_utf8_lossy(&bytes[from..upto]).into_owned()
 }
 
 /// Parse the string whose opening quote is at `open`. Returns the string and
@@ -379,9 +402,9 @@ pub(crate) fn parse_string(bytes: &[u8], open: usize) -> Result<(Str<'_>, usize)
         let Some(hit) = find_interest(bytes, i, quote) else {
             return Err(Error::UnterminatedString { offset: open });
         };
-        u.push_raw(i, hit)?;
+        u.push_raw(i, hit);
         match bytes[hit] {
-            b if b == quote => return Ok((u.finish(hit)?, hit + 1)),
+            b if b == quote => return Ok((u.finish(hit), hit + 1)),
             // Raw LF/CR are illegal; raw U+2028/U+2029 never trigger this
             // scan and stay in the content.
             b'\n' | b'\r' => {
@@ -397,8 +420,9 @@ pub(crate) fn parse_string(bytes: &[u8], open: usize) -> Result<(Str<'_>, usize)
 
 /// Offset of the first byte of interest to the string scanner at or after
 /// `from`: the closing `quote`, a backslash, or a raw line terminator.
-/// SWAR scan over little-endian words (four byte-membership tests in ~20 ALU
-/// ops per 8 bytes), class-table tail for the final partial word.
+/// SWAR scan over little-endian words, 16 bytes (two u64) per iteration;
+/// on a hit the first half with a match is picked and located within by its
+/// first set high bit. Class-table tail for the final partial stretch.
 fn find_interest(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
     const ONES: u64 = 0x0101_0101_0101_0101;
     const HIBITS: u64 = 0x8080_8080_8080_8080;
@@ -409,17 +433,30 @@ fn find_interest(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
     const fn has_zero(x: u64) -> u64 {
         x.wrapping_sub(ONES) & !x & HIBITS
     }
+    /// Interest mask of one word: quote, backslash, LF or CR bytes.
+    const fn interest_mask(w: u64, q: u64) -> u64 {
+        has_zero(w ^ q) | has_zero(w ^ BS) | has_zero(w ^ LF) | has_zero(w ^ CR)
+    }
     let q = ONES * u64::from(quote);
     let mut i = from;
-    while i + 8 <= bytes.len() {
+    while i + 16 <= bytes.len() {
         // from_le_bytes pins the word order, so trailing_zeros/8 is the first
         // matching byte regardless of the host endianness.
-        let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-        let m = has_zero(w ^ q) | has_zero(w ^ BS) | has_zero(w ^ LF) | has_zero(w ^ CR);
-        if m != 0 {
-            return Some(i + (m.trailing_zeros() / 8) as usize);
+        let m0 = interest_mask(u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap()), q);
+        let m1 = interest_mask(
+            u64::from_le_bytes(bytes[i + 8..i + 16].try_into().unwrap()),
+            q,
+        );
+        if (m0 | m1) != 0 {
+            // First half with a hit, then the first matching byte in it.
+            let (m, k) = if m0 != 0 {
+                (m0, 0)
+            } else {
+                (m1, 8)
+            };
+            return Some(i + k + (m.trailing_zeros() / 8) as usize);
         }
-        i += 8;
+        i += 16;
     }
     let interest = class::BACKSLASH
         | class::LF
@@ -457,6 +494,11 @@ fn process_escape(bytes: &[u8], esc: usize, u: &mut Unescape<'_>) -> Result<usiz
             }
             u.push_char(esc, '\0');
         },
+        // Decimal digits are not NonEscapeCharacters in the JSON5 grammar
+        // (the production excludes EscapeCharacter, which contains
+        // DecimalDigit), so \1..\9 are errors, not the digit itself; json5-js
+        // rejects them too.
+        b'1'..=b'9' => return Err(Error::InvalidEscape { offset: esc }),
         b'x' => {
             let mut v = 0_u32;
             for k in 2..4 {
@@ -547,9 +589,17 @@ fn hex4(bytes: &[u8], at: usize) -> Option<u16> {
     Some(v)
 }
 
-/// UTF-8 slice of `bytes[a..b]`. Unreachable on `&str`-validated input.
-fn str_slice(bytes: &[u8], a: usize, b: usize) -> Result<&str> {
-    core::str::from_utf8(&bytes[a..b]).map_err(|_| Error::InvalidUtf8 { offset: a })
+/// UTF-8 slice of `bytes[a..b]`.
+///
+/// Unchecked in release: every input reaching the parser is valid UTF-8
+/// (`from_str` receives a `&str`, `from_slice` validates at entry), and both
+/// ends of every slice taken here are either ASCII bytes or positions
+/// produced by `decode_seq`, which consumes whole UTF-8 sequences.
+fn str_slice(bytes: &[u8], a: usize, b: usize) -> &str {
+    let raw = &bytes[a..b];
+    debug_assert!(core::str::from_utf8(raw).is_ok());
+    // SAFETY: valid UTF-8 by the contract above; the debug_assert pins it.
+    unsafe { core::str::from_utf8_unchecked(raw) }
 }
 
 /// Incrementally unescaped string body. The owned buffer is materialized
@@ -570,13 +620,14 @@ impl<'a> Unescape<'a> {
     }
 
     /// Owned buffer, materialized from the raw prefix `..upto` on first use.
-    /// The prefix is valid UTF-8 without line terminators: the scanner stops
-    /// at those before any escape can be reached, so the lossy conversion is
-    /// exact.
+    /// The prefix is valid UTF-8 by the parser's input contract (`from_str`
+    /// and `from_slice` validate it), so the conversion is exact. It may
+    /// contain raw LS/PS (legal string content); only raw LF/CR are
+    /// impossible — the scanner stops at those before any escape.
     fn buf(&mut self, upto: usize) -> &mut String {
-        self.out.get_or_insert_with(|| {
-            String::from_utf8_lossy(&self.bytes[self.start..upto]).into_owned()
-        })
+        let (bytes, start) = (self.bytes, self.start);
+        self.out
+            .get_or_insert_with(|| str_slice(bytes, start, upto).to_owned())
     }
 
     fn push_char(&mut self, upto: usize, c: char) {
@@ -590,22 +641,20 @@ impl<'a> Unescape<'a> {
     }
 
     /// Append the raw bytes `[a..b)` once unescaping has started.
-    fn push_raw(&mut self, a: usize, b: usize) -> Result<()> {
-        // Validate only when the bytes are actually consumed: the borrowed
-        // fast path needs no `&str` at all, so escape-free strings never pay
-        // for a UTF-8 pass here (finish() still validates the whole body).
+    fn push_raw(&mut self, a: usize, b: usize) {
+        // Raw segments are only consumed once unescaping has started;
+        // escape-free strings keep the borrowed fast path and never touch a
+        // String here.
         if b > a && self.out.is_some() {
             let bytes = self.bytes;
-            let raw = str_slice(bytes, a, b)?;
-            self.buf(a).push_str(raw);
+            self.buf(a).push_str(str_slice(bytes, a, b));
         }
-        Ok(())
     }
 
-    fn finish(self, close: usize) -> Result<Str<'a>> {
+    fn finish(self, close: usize) -> Str<'a> {
         match self.out {
-            Some(o) => Ok(Str::Dynamic(o)),
-            None => Ok(Str::Static(str_slice(self.bytes, self.start, close)?)),
+            Some(o) => Str::Dynamic(o),
+            None => Str::Static(str_slice(self.bytes, self.start, close)),
         }
     }
 }
@@ -702,8 +751,8 @@ mod tests {
             ok(r#""\b\f\n\r\t\v\0\'\"\\\x41\u0042""#).as_str(),
             Some("\u{8}\u{c}\n\r\t\u{b}\0'\"\\A\u{42}")
         );
-        // Any other \c produces c.
-        assert_eq!(ok(r#""\q\1\ ""#).as_str(), Some("q1 "));
+        // Any other \c produces c; \1..\9 are rejected (see process_escape).
+        assert_eq!(ok(r#""\q\ ""#).as_str(), Some("q "));
         assert_eq!(ok(r#""😀""#).as_str(), Some("\u{1f600}"));
     }
 
@@ -760,7 +809,10 @@ mod tests {
         assert_eq!(err(r#""\uDC00""#), Error::InvalidUnicodeEscape {
             offset: 1
         });
-        // \0 followed by a non-digit is fine.
+        // \1..\9 are not NonEscapeCharacters; \0 followed by a non-digit is
+        // fine.
+        assert_eq!(err(r#""\1""#), Error::InvalidEscape { offset: 1 });
+        assert_eq!(err(r#""\9""#), Error::InvalidEscape { offset: 1 });
         assert_eq!(ok(r#""\0 ""#).as_str(), Some("\0 "));
     }
 
@@ -774,6 +826,27 @@ mod tests {
         assert_eq!(m.get_index(3).unwrap().0.as_str(), "é");
         assert_eq!(m.get_index(4).unwrap().0.as_str(), "a");
         assert_eq!(m.get_index(5).unwrap().0.as_str(), "ab");
+    }
+
+    /// Bytes between, after and around identifier escapes must survive; a
+    /// former bug dropped every ASCII byte after the first escape.
+    #[test]
+    fn identifier_bytes_around_escapes_are_kept() {
+        let v = ok(r"{a\u0062c: 1, a\u0062b\u0063: 2}");
+        let m = v.as_object().unwrap();
+        assert_eq!(m.get_index(0).unwrap().0.as_str(), "abc");
+        assert_eq!(m.get_index(1).unwrap().0.as_str(), "abbc");
+        // Non-ASCII between and after escapes, and an escape-first key.
+        let v = ok("{ é\\u0062x: 1, \\u0061é: 2 }");
+        let m = v.as_object().unwrap();
+        assert_eq!(m.get_index(0).unwrap().0.as_str(), "ébx");
+        assert_eq!(m.get_index(1).unwrap().0.as_str(), "aé");
+        // Quoted keys always worked; pinned as the contrast oracle.
+        let v = ok(r#"{"a\u0062c": 1}"#);
+        assert_eq!(
+            v.as_object().unwrap().get_index(0).unwrap().0.as_str(),
+            "abc"
+        );
     }
 
     #[test]

@@ -64,6 +64,27 @@ fn string_escapes() {
     assert_eq!(ser("é\té"), "\"é\\té\"");
 }
 
+/// Escapes at every alignment relative to the 8-byte SWAR words of the fast
+/// path, including multi-byte sequences straddling word boundaries.
+#[test]
+fn string_escape_word_boundaries() {
+    let ser = |s: &str| to_string(&Value::Str(Str::Static(s)));
+    for n in 0..24 {
+        let multibyte = "éx".repeat(n);
+        assert_eq!(ser(&multibyte), format!("\"{multibyte}\""));
+        let quote = format!("{}\"{}", "a".repeat(n), "b".repeat(16));
+        assert_eq!(
+            ser(&quote),
+            format!("\"{}\\\"{}\"", "a".repeat(n), "b".repeat(16))
+        );
+        let control = format!("{}\n{}", "a".repeat(n), "b".repeat(16));
+        assert_eq!(
+            ser(&control),
+            format!("\"{}\\n{}\"", "a".repeat(n), "b".repeat(16))
+        );
+    }
+}
+
 #[test]
 fn nesting_and_containers() {
     assert_eq!(to_string(&Value::Array(vec![])), "[]");
@@ -95,6 +116,16 @@ fn to_vec_matches_to_string() {
 #[test]
 fn display_matches_to_string() {
     let value = sample();
+    assert_eq!(format!("{value}"), to_string(&value));
+}
+
+/// `Display` streams through a chunked sink; a chunk boundary may split a
+/// multi-byte sequence, so long multibyte output must still round the
+/// formatter correctly.
+#[test]
+fn display_streams_long_multibyte_output() {
+    // Leading ASCII byte misaligns the chunks so boundaries fall mid-é.
+    let value = Value::Str(Str::Dynamic(format!("x{}", "é".repeat(300))));
     assert_eq!(format!("{value}"), to_string(&value));
 }
 

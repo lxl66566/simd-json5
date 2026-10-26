@@ -172,6 +172,32 @@ fn str_serialize() {
     assert_eq!(text, r#""s\tv""#);
 }
 
+/// f32 values take ryu's f32 shortest path, byte-identical to serde_json;
+/// widening to f64 first would print `0.1f32` as `0.10000000149011612`.
+#[test]
+fn f32_matches_serde_json_and_roundtrips() {
+    for v in [
+        0.1f32,
+        -0.1f32,
+        1.0 / 3.0,
+        f32::MIN_POSITIVE,
+        1e-40,
+        16_777_217.0,
+    ] {
+        let text = typed::to_string(&v).unwrap();
+        assert_eq!(text, serde_json::to_string(&v).unwrap(), "value {v}");
+        assert_eq!(
+            simd_json5::de::from_str::<f32>(&text).unwrap(),
+            v,
+            "text {text}"
+        );
+    }
+    // Non-finite f32 keeps the JSON5 literals.
+    assert_eq!(typed::to_string(&f32::NAN).unwrap(), "NaN");
+    assert_eq!(typed::to_string(&f32::INFINITY).unwrap(), "Infinity");
+    assert_eq!(typed::to_string(&f32::NEG_INFINITY).unwrap(), "-Infinity");
+}
+
 /// serde_json formats float exponents through the zmij fork (`1e+300`),
 /// while DESIGN pins our floats to ryu (`1e300`); normalize both sides.
 fn normalize_exponent(text: &str) -> String {

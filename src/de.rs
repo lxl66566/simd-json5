@@ -6,7 +6,13 @@
 //! [`crate::value::MAX_DEPTH`]). Strings that need no unescaping reach
 //! visitors as borrowed `&str`; escape-containing strings arrive owned. Type
 //! mismatches surface as [`Error::Custom`] through the [`serde::de::Error`]
-//! impl.
+//! impl; [`from_str`] re-reports those with the read position as
+//! [`Error::Syntax`], so every typed-path error carries an offset like the
+//! DOM path's errors do.
+//!
+//! The visitor walk recurses through serde frames, so documents near
+//! [`crate::value::MAX_DEPTH`] need a large stack — about 32 MiB reaches the
+//! limit (the DOM path uses an explicit stack and has no such requirement).
 //!
 //! ```
 //! #[derive(serde::Deserialize)]
@@ -23,7 +29,13 @@ use serde::de::{self, DeserializeSeed, Unexpected, Visitor};
 
 use crate::{
     Error, Result,
-    parser::{simd, stage1::token_end, stage2},
+    parser::{
+        container_counts,
+        number::{self, Num},
+        simd,
+        stage1::token_end,
+        stage2,
+    },
     value::{MAX_DEPTH, Map, Str, Value},
 };
 
@@ -33,12 +45,30 @@ pub fn from_str<'de, T>(s: &'de str) -> Result<T>
 where
     T: serde::Deserialize<'de>,
 {
-    let mut index = Vec::new();
+    // One index entry per ~8 input bytes up front, like `parser::parse`;
+    // growing from an empty vec pays the reallocation chain this avoids.
+    let mut index = Vec::with_capacity(s.len() / 8);
     simd::build_index(s.as_bytes(), &mut index)?;
-    let mut de = Deserializer::new(s.as_bytes(), &index);
-    let value = T::deserialize(&mut de)?;
+    let counts = container_counts(s.as_bytes(), &index);
+    let mut de = Deserializer::new(s.as_bytes(), &index, counts.as_slice());
+    let value = T::deserialize(&mut de).map_err(|e| locate(e, &de))?;
     de.end()?;
     Ok(value)
+}
+
+/// Attach the current read position to serde visitor errors, which arrive as
+/// position-less [`Error::Custom`] (`invalid type`, `missing field`, ...).
+/// Re-reported as [`Error::Syntax`] they match the always-positioned errors
+/// of the DOM path, like serde_json's located type errors. Errors that
+/// already carry an offset pass through unchanged.
+fn locate(e: Error, de: &Deserializer<'_, '_>) -> Error {
+    match e {
+        Error::Custom(message) => Error::Syntax {
+            offset: de.offset(),
+            message,
+        },
+        located => located,
+    }
 }
 
 /// Deserialize `T` from raw JSON5 bytes; fails if `v` is not valid UTF-8,
@@ -101,6 +131,10 @@ fn syntax(message: &str, offset: usize) -> Error {
 struct Deserializer<'a, 'de> {
     bytes: &'de [u8],
     index: &'a [u32],
+    /// Child-count hints keyed by index position of each container opening
+    /// (see [`container_counts`]); consulted by the `size_hint` overrides of
+    /// [`SeqAccess`] and [`MapAccess`] only.
+    counts: &'a [u32],
     pos: usize,
     depth: usize,
     ctx: Ctx,
@@ -112,10 +146,11 @@ struct Deserializer<'a, 'de> {
 }
 
 impl<'a, 'de> Deserializer<'a, 'de> {
-    fn new(bytes: &'de [u8], index: &'a [u32]) -> Self {
+    fn new(bytes: &'de [u8], index: &'a [u32], counts: &'a [u32]) -> Self {
         Self {
             bytes,
             index,
+            counts,
             pos: 0,
             depth: 0,
             ctx: Ctx::Top,
@@ -131,11 +166,21 @@ impl<'a, 'de> Deserializer<'a, 'de> {
         }
     }
 
+    /// Byte and offset of the current entry in one index lookup, or `None`
+    /// when the index is exhausted (EOF).
+    fn peek_entry(&self) -> Option<(u8, usize)> {
+        match self.index.get(self.pos) {
+            Some(&e) => {
+                let off = usize::try_from(e).expect("stage 1 offsets are input positions");
+                Some((self.bytes[off], off))
+            },
+            None => None,
+        }
+    }
+
     /// Byte at the current entry, or `None` when the index is exhausted.
     fn peek_byte(&self) -> Option<u8> {
-        self.index
-            .get(self.pos)
-            .map(|&e| self.bytes[usize::try_from(e).expect("stage 1 offsets are input positions")])
+        self.peek_entry().map(|(b, _)| b)
     }
 
     /// Advance past the current entry.
@@ -157,12 +202,11 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// its entry. Structural bytes in value position produce the same errors
     /// stage 2 would.
     fn parse_scalar(&mut self) -> Result<Value<'de>> {
-        let Some(b) = self.peek_byte() else {
+        let Some((b, off)) = self.peek_entry() else {
             return Err(Error::UnexpectedEof {
                 offset: self.bytes.len(),
             });
         };
-        let off = self.offset();
         match b {
             b'"' | b'\'' => {
                 let (s, _) = stage2::parse_string(self.bytes, off)?;
@@ -238,15 +282,49 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Parse a number for an integer-expecting method, hinting by variant
     /// so range checks stay with the visitor.
     fn parse_integer<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
-        let v = self.parse_scalar_or_type_error(&visitor)?;
-        visit_number(v, visitor)
+        match self.try_current_num() {
+            Some(Ok(n)) => visit_num(n, visitor),
+            Some(Err(e)) => Err(e),
+            None => {
+                let v = self.parse_scalar_or_type_error(&visitor)?;
+                visit_number(v, visitor)
+            },
+        }
+    }
+
+    /// Fast path: interpret the entry at `off` as a bare number token and
+    /// advance past it. The caller has checked [`number::is_num_start`] on the
+    /// entry byte, which is exactly the byte set `stage2::token_value` routes
+    /// to `number::parse` — so behavior is identical to the scalar slow path,
+    /// minus the generic token classification and intermediate `Value`.
+    fn parse_current_num(&mut self, off: usize) -> Result<Num> {
+        let end = token_end(self.bytes, off);
+        let n = number::parse_num(&self.bytes[off..end], off)?;
+        self.bump();
+        Ok(n)
+    }
+
+    /// Number fast path for the typed scalar methods: parse the current entry
+    /// as a number when it can start one. `None` means the entry cannot start
+    /// a number; the caller keeps its scalar slow path, which owns the
+    /// `[`/`{` type errors, the structural-byte diagnostics and the bare
+    /// `Infinity`/`NaN` keywords.
+    fn try_current_num(&mut self) -> Option<Result<Num>> {
+        let (b, off) = self.peek_entry()?;
+        if !number::is_num_start(b) {
+            return None;
+        }
+        Some(self.parse_current_num(off))
     }
 
     /// Dispatch a value to `visitor` by its entry kind.
     fn parse_value<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
-        match self.peek_byte() {
-            Some(b'[') => self.parse_array(visitor),
-            Some(b'{') => self.parse_object(visitor),
+        match self.peek_entry() {
+            Some((b'[', _)) => self.parse_array(visitor),
+            Some((b'{', _)) => self.parse_object(visitor),
+            Some((b, off)) if number::is_num_start(b) => {
+                visit_num(self.parse_current_num(off)?, visitor)
+            },
             _ => {
                 let v = self.parse_scalar()?;
                 visit_scalar(v, visitor)
@@ -271,10 +349,16 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Parse an array through `visit_seq`. Elements past an early visitor
     /// stop are validated and skipped by `finish_seq`.
     fn parse_array<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
+        // Capture the `[` entry's index position for the counts table
+        // before `open_container` advances past it.
+        let open = self.pos;
         self.open_container(self.offset())?;
         let saved = self.started;
         self.started = false;
-        let result = visitor.visit_seq(SeqAccess { de: &mut *self });
+        let result = visitor.visit_seq(SeqAccess {
+            de: &mut *self,
+            open,
+        });
         let started = self.started;
         self.started = saved;
         match result {
@@ -295,10 +379,14 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Parse an object through `visit_map`. Members past an early visitor
     /// stop are validated and skipped by `finish_map`.
     fn parse_object<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
+        let open = self.pos;
         self.open_container(self.offset())?;
         let saved = self.started;
         self.started = false;
-        let result = visitor.visit_map(MapAccess { de: &mut *self });
+        let result = visitor.visit_map(MapAccess {
+            de: &mut *self,
+            open,
+        });
         let started = self.started;
         self.started = saved;
         match result {
@@ -563,10 +651,33 @@ fn visit_number<'de, V: Visitor<'de>>(v: Value<'de>, visitor: V) -> Result<V::Va
     }
 }
 
+/// Feed a fast-path [`Num`] to `visitor` by variant, matching `visit_scalar`
+/// and `visit_number` exactly (U64 -> `visit_u64`, I64 -> `visit_i64`,
+/// F64 -> `visit_f64`).
+fn visit_num<'de, V: Visitor<'de>>(n: Num, visitor: V) -> Result<V::Value> {
+    match n {
+        Num::U64(u) => visitor.visit_u64(u),
+        Num::I64(i) => visitor.visit_i64(i),
+        Num::F64(f) => visitor.visit_f64(f),
+    }
+}
+
+/// Cap a self-computed capacity hint, mirroring serde's internal
+/// `size_hint::cautious` (not public in current serde): preallocate at most
+/// 1 MiB worth of elements, so a hostile estimate cannot force a huge up-front
+/// allocation; beyond the cap collections keep growing by doubling.
+fn cautious<E>(hint: Option<usize>) -> usize {
+    const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
+    let max = MAX_PREALLOC_BYTES / size_of::<E>().max(1);
+    hint.unwrap_or(0).min(max)
+}
+
 /// Array element feed for `visit_seq`; elements are parsed on demand through
 /// the shared comma lookahead in [`Deserializer::seq_step`].
 struct SeqAccess<'b, 'a, 'de> {
     de: &'b mut Deserializer<'a, 'de>,
+    /// Index position of this array's `[` entry; keys `de.counts`.
+    open: usize,
 }
 
 impl<'de> de::SeqAccess<'de> for SeqAccess<'_, '_, 'de> {
@@ -584,12 +695,22 @@ impl<'de> de::SeqAccess<'de> for SeqAccess<'_, '_, 'de> {
         self.de.ctx = Ctx::Element;
         seed.deserialize(&mut *self.de).map(Some)
     }
+
+    fn size_hint(&self) -> Option<usize> {
+        // The element count recorded when this array opened. Visitors read
+        // it before the first element (serde's Vec visitor calls it once);
+        // afterwards it stays a safe upper bound (trailing comma). `None`
+        // when the table was skipped for a tiny document.
+        self.de.counts.get(self.open).map(|&c| c as usize)
+    }
 }
 
 /// Object member feed for `visit_map`; keys are parsed eagerly (string or
 /// identifier), values on demand.
 struct MapAccess<'b, 'a, 'de> {
     de: &'b mut Deserializer<'a, 'de>,
+    /// Index position of this object's `{` entry; keys `de.counts`.
+    open: usize,
 }
 
 impl<'de> de::MapAccess<'de> for MapAccess<'_, '_, 'de> {
@@ -615,6 +736,11 @@ impl<'de> de::MapAccess<'de> for MapAccess<'_, '_, 'de> {
         self.de.expect_colon()?;
         self.de.ctx = Ctx::MemberValue;
         seed.deserialize(&mut *self.de)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        // Like the seq case; duplicate keys can only over-estimate.
+        self.de.counts.get(self.open).map(|&c| c as usize)
     }
 }
 
@@ -647,7 +773,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     type Error = Error;
 
     serde::forward_to_deserialize_any! {
-        char str string bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        char str string bytes byte_buf unit unit_struct seq tuple
         tuple_struct map struct identifier ignored_any
     }
 
@@ -656,6 +782,23 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
         V: Visitor<'de>,
     {
         self.visit(visitor)
+    }
+
+    /// A map key is always text, never `null`, so an `Option` key is always
+    /// `Some` — like serde_json.
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_some(self)
+    }
+
+    /// Newtype keys take their inner type from the key text.
+    fn deserialize_newtype_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_newtype_struct(self)
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
@@ -790,12 +933,14 @@ impl<'de> de::EnumAccess<'de> for UnitVariantAccess<'de> {
     type Error = Error;
     type Variant = Self;
 
-    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant)>
+    fn variant_seed<V>(mut self, seed: V) -> Result<(V::Value, Self::Variant)>
     where
         V: DeserializeSeed<'de>,
     {
+        // The VariantAccess impls never read `variant`, so take the name
+        // instead of cloning it (an allocation for escaped variant names).
         let value = seed.deserialize(MapKeyDeserializer {
-            key: self.variant.clone(),
+            key: core::mem::take(&mut self.variant),
         })?;
         Ok((value, self))
     }
@@ -872,13 +1017,31 @@ struct EnumVariantAccess<'b, 'a, 'de> {
 }
 
 impl EnumVariantAccess<'_, '_, '_> {
-    /// Consume the closing `}`; anything else means the enum object carried
-    /// more than one member.
+    /// Consume the closing `}`, accepting the same single optional trailing
+    /// comma as `map_step`; anything else means the enum object carried more
+    /// than one member.
     fn finish(self) -> Result<()> {
         match self.de.peek_byte() {
             Some(b'}') => {
                 self.de.bump();
                 Ok(())
+            },
+            // One optional trailing comma directly before `}`; a comma
+            // leading anywhere else is a second member, reported at the
+            // comma like the pre-trailing-comma behavior.
+            Some(b',') => {
+                let comma = self.de.offset();
+                self.de.bump();
+                match self.de.peek_byte() {
+                    Some(b'}') => {
+                        self.de.bump();
+                        Ok(())
+                    },
+                    Some(_) => Err(Error::TrailingCharacters { offset: comma }),
+                    None => Err(Error::UnexpectedEof {
+                        offset: self.de.bytes.len(),
+                    }),
+                }
             },
             Some(_) => Err(Error::TrailingCharacters {
                 offset: self.de.offset(),
@@ -1013,7 +1176,9 @@ impl<'de> Visitor<'de> for ValueVisitor {
     where
         A: de::SeqAccess<'de>,
     {
-        let mut items = Vec::new();
+        // The hint is exact except for a trailing comma; `cautious` bounds
+        // the preallocation, beyond it the vec keeps doubling.
+        let mut items = Vec::with_capacity(cautious::<Value<'de>>(seq.size_hint()));
         while let Some(v) = seq.next_element()? {
             items.push(v);
         }
@@ -1024,7 +1189,8 @@ impl<'de> Visitor<'de> for ValueVisitor {
     where
         A: de::MapAccess<'de>,
     {
-        let mut entries = Map::new();
+        let mut entries =
+            Map::with_capacity(cautious::<(Str<'de>, Value<'de>)>(access.size_hint()));
         // IndexMap::insert keeps the first position and the last value, the
         // JavaScript duplicate-key semantics of stage 2.
         while let Some((k, v)) = access.next_entry()? {
@@ -1156,12 +1322,18 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
     where
         V: Visitor<'de>,
     {
-        match self.parse_scalar_or_type_error(&visitor)? {
+        match self.try_current_num() {
             // The number grammar tops out at u64/i64; widen the hint.
-            Value::U64(u) => visitor.visit_u128(u128::from(u)),
-            Value::I64(i) => visitor.visit_i128(i128::from(i)),
-            Value::F64(f) => visitor.visit_f64(f),
-            other => Err(invalid_type_value(&other, &visitor)),
+            Some(Ok(Num::U64(u))) => visitor.visit_u128(u128::from(u)),
+            Some(Ok(Num::I64(i))) => visitor.visit_i128(i128::from(i)),
+            Some(Ok(Num::F64(f))) => visitor.visit_f64(f),
+            Some(Err(e)) => Err(e),
+            None => match self.parse_scalar_or_type_error(&visitor)? {
+                Value::U64(u) => visitor.visit_u128(u128::from(u)),
+                Value::I64(i) => visitor.visit_i128(i128::from(i)),
+                Value::F64(f) => visitor.visit_f64(f),
+                other => Err(invalid_type_value(&other, &visitor)),
+            },
         }
     }
 
@@ -1169,11 +1341,18 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
     where
         V: Visitor<'de>,
     {
-        match self.parse_scalar_or_type_error(&visitor)? {
-            Value::U64(u) => visitor.visit_u128(u128::from(u)),
-            Value::I64(i) => visitor.visit_i128(i128::from(i)),
-            Value::F64(f) => visitor.visit_f64(f),
-            other => Err(invalid_type_value(&other, &visitor)),
+        match self.try_current_num() {
+            // The number grammar tops out at u64/i64; widen the hint.
+            Some(Ok(Num::U64(u))) => visitor.visit_u128(u128::from(u)),
+            Some(Ok(Num::I64(i))) => visitor.visit_i128(i128::from(i)),
+            Some(Ok(Num::F64(f))) => visitor.visit_f64(f),
+            Some(Err(e)) => Err(e),
+            None => match self.parse_scalar_or_type_error(&visitor)? {
+                Value::U64(u) => visitor.visit_u128(u128::from(u)),
+                Value::I64(i) => visitor.visit_i128(i128::from(i)),
+                Value::F64(f) => visitor.visit_f64(f),
+                other => Err(invalid_type_value(&other, &visitor)),
+            },
         }
     }
 
@@ -1188,11 +1367,17 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
     where
         V: Visitor<'de>,
     {
-        match self.parse_scalar_or_type_error(&visitor)? {
-            Value::F64(f) => visitor.visit_f64(f),
-            Value::U64(u) => visitor.visit_u64(u),
-            Value::I64(i) => visitor.visit_i64(i),
-            other => Err(invalid_type_value(&other, &visitor)),
+        match self.try_current_num() {
+            // Same variant-to-visitor mapping as the slow path below; only
+            // the match order differs.
+            Some(Ok(n)) => visit_num(n, visitor),
+            Some(Err(e)) => Err(e),
+            None => match self.parse_scalar_or_type_error(&visitor)? {
+                Value::F64(f) => visitor.visit_f64(f),
+                Value::U64(u) => visitor.visit_u64(u),
+                Value::I64(i) => visitor.visit_i64(i),
+                other => Err(invalid_type_value(&other, &visitor)),
+            },
         }
     }
 
@@ -1577,7 +1762,9 @@ mod tests {
         // Structs accept the seq form like serde_json.
         assert_eq!(from_str::<Point>("[3,4]").unwrap(), Point { x: 3, y: 4 });
         let err = from_str::<Point>("{x:1}").unwrap_err();
-        assert!(matches!(&err, Error::Custom(m) if m.contains("missing field `y`")));
+        assert!(
+            matches!(&err, Error::Syntax { message, .. } if message.contains("missing field `y`"))
+        );
     }
 
     #[test]
@@ -1588,13 +1775,29 @@ mod tests {
         assert_eq!(from_str::<char>("'\\uD83D\\uDE00'").unwrap(), '\u{1f600}');
         assert_eq!(from_str::<Vec<u8>>("[1,2,3]").unwrap(), vec![1, 2, 3]);
         assert_eq!(from_str::<(u8, u8)>("[1,2]").unwrap(), (1, 2));
-        // Range and type mismatches surface as serde custom errors.
+        // Range and type mismatches surface as positioned serde errors.
         let err = from_str::<u8>("300").unwrap_err();
-        assert!(matches!(&err, Error::Custom(m) if m.contains("invalid value")));
+        assert!(matches!(&err, Error::Syntax { message, .. } if message.contains("invalid value")));
         let err = from_str::<bool>("1").unwrap_err();
-        assert!(matches!(&err, Error::Custom(m) if m.contains("invalid type")));
+        assert!(matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type")));
         let err = from_str::<String>("true").unwrap_err();
-        assert!(matches!(&err, Error::Custom(m) if m.contains("invalid type")));
+        assert!(matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type")));
+    }
+
+    /// serde visitor errors are re-reported with the read position, so typed
+    /// type errors carry offsets like every other parse error.
+    #[test]
+    fn type_errors_carry_offsets() {
+        // After the scalar is consumed the cursor is past end of input.
+        let err = from_str::<bool>("1").unwrap_err();
+        assert!(
+            matches!(&err, Error::Syntax { message, offset: 1 } if message.contains("invalid type"))
+        );
+        // The visitor gave up with the cursor on the closing brace.
+        let err = from_str::<Point>("{x:1}").unwrap_err();
+        assert!(
+            matches!(&err, Error::Syntax { message, offset: 4 } if message.contains("missing field"))
+        );
     }
 
     #[test]
@@ -1606,16 +1809,28 @@ mod tests {
         assert_eq!(from_str::<E>("{B: 1}").unwrap(), E::B(1));
         assert_eq!(from_str::<E>(r#"{"B": 2}"#).unwrap(), E::B(2));
         assert_eq!(from_str::<E>(r#"{"C": {x: 2}}"#).unwrap(), E::C { x: 2 });
+        // The map form accepts one trailing comma, like any JSON5 object.
+        assert_eq!(from_str::<E>("{B: 1,}").unwrap(), E::B(1));
+        assert_eq!(from_str::<E>(r#"{"C": {x: 2},}"#).unwrap(), E::C { x: 2 });
+        assert_eq!(from_str::<E>(r#"{"A": null,}"#).unwrap(), E::A);
         // A payload on a unit variant is a type error.
         let err = from_str::<E>(r#"{"A": 1}"#).unwrap_err();
-        assert!(matches!(&err, Error::Custom(m) if m.contains("invalid type")));
+        assert!(matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type")));
         // So is a bare string naming a non-unit variant.
         let err = from_str::<E>(r#""B""#).unwrap_err();
-        assert!(matches!(&err, Error::Custom(m) if m.contains("unit variant")));
+        assert!(matches!(&err, Error::Syntax { message, .. } if message.contains("unit variant")));
         // Empty map and extra members.
-        assert!(matches!(from_str::<E>("{}").unwrap_err(), Error::Custom(_)));
+        assert!(matches!(
+            from_str::<E>("{}").unwrap_err(),
+            Error::Syntax { .. }
+        ));
         assert_eq!(
             from_str::<E>(r#"{"B":1,"B":2}"#).unwrap_err(),
+            Error::TrailingCharacters { offset: 6 }
+        );
+        // A second comma is still the multi-member error, at the comma.
+        assert_eq!(
+            from_str::<E>(r#"{"B":1,,}"#).unwrap_err(),
             Error::TrailingCharacters { offset: 6 }
         );
     }

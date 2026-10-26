@@ -32,6 +32,14 @@ let p: Point = simd_json5::de::from_str("{ x: 1, y: 2 }").unwrap();
 assert_eq!(simd_json5::typed::to_string(&p).unwrap(), r#"{"x":1,"y":2}"#);
 ```
 
+## Serialization notes
+
+- Map keys must be strings (or string-like: `char`, unit variant names).
+  Integer, bool or float keys are rejected with an error instead of being
+  rendered as quoted strings the way `serde_json` does.
+- Non-finite floats serialize as the JSON5 literals `NaN` / `Infinity` /
+  `-Infinity`; all other output is strict JSON.
+
 ## Feature flags
 
 | Feature | Default | Description |

@@ -20,29 +20,63 @@ pub(crate) fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// A parsed number split by variant, for callers that dispatch on the
+/// integer/float kind without building a DOM [`Value`] (the serde fast path).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Num {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+
+/// First bytes a number token may start with: exactly the byte set
+/// `stage2::token_value` routes to [`parse_num`]. No bare identifier (`null`,
+/// `true`, keywords) can begin with one, so the serde fast path uses this to
+/// pick [`parse_num`] without the generic token classification.
+#[must_use]
+pub(crate) fn is_num_start(b: u8) -> bool {
+    matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9')
+}
+
 /// Parse a bare number token. `token` is the full maximal token run reported
 /// by stage 1; `offset` is its first byte position in the input, used for
 /// errors.
-pub(crate) fn parse(token: &[u8], offset: usize) -> Result<Value<'static>> {
+pub(crate) fn parse_num(token: &[u8], offset: usize) -> Result<Num> {
     let (neg, rest) = match token.first() {
         Some(&b'+') => (false, &token[1..]),
         Some(&b'-') => (true, &token[1..]),
         _ => (false, token),
     };
     if rest == b"Infinity" {
-        return Ok(Value::F64(if neg {
+        return Ok(Num::F64(if neg {
             f64::NEG_INFINITY
         } else {
             f64::INFINITY
         }));
     }
     if rest == b"NaN" {
-        return Ok(Value::F64(f64::NAN));
+        return Ok(Num::F64(f64::NAN));
     }
     if matches!(rest.first(), Some(&b'0') if matches!(rest.get(1), Some(&(b'x' | b'X')))) {
         return parse_hex(&rest[2..], neg, offset);
     }
     parse_decimal(rest, neg, offset)
+}
+
+/// DOM entry: the grammar in [`parse_num`] mapped onto [`Value`] variants.
+pub(crate) fn parse(token: &[u8], offset: usize) -> Result<Value<'static>> {
+    Ok(match parse_num(token, offset)? {
+        Num::I64(i) => Value::I64(i),
+        Num::U64(u) => Value::U64(u),
+        Num::F64(f) => Value::F64(f),
+    })
+}
+
+/// `Error::InvalidNumber` constructor. Cold: keeps the error paths out of
+/// the hot digit loops' instruction stream.
+#[cold]
+fn invalid_number(offset: usize) -> Error {
+    Error::InvalidNumber { offset }
 }
 
 /// Hexadecimal integer: `0x` has already been consumed.
@@ -51,11 +85,11 @@ pub(crate) fn parse(token: &[u8], offset: usize) -> Result<Value<'static>> {
     clippy::cast_possible_truncation, // in-range by the adjacent bound checks
     clippy::cast_possible_wrap // acc <= 2^63, so `as i64` only "wraps" 2^63 to i64::MIN
 )]
-fn parse_hex(digits: &[u8], neg: bool, offset: usize) -> Result<Value<'static>> {
+fn parse_hex(digits: &[u8], neg: bool, offset: usize) -> Result<Num> {
     const TWO_POW_63: u128 = 1 << 63;
     const U64_MAX: u128 = u64::MAX as u128;
     if digits.is_empty() {
-        return Err(Error::InvalidNumber { offset });
+        return Err(invalid_number(offset));
     }
     let mut acc: u128 = 0;
     // Past u128 range the value keeps accumulating in f64; beyond 2^128 the
@@ -64,7 +98,7 @@ fn parse_hex(digits: &[u8], neg: bool, offset: usize) -> Result<Value<'static>> 
     let mut wide: Option<f64> = None;
     for &d in digits {
         let Some(v) = hex_val(d) else {
-            return Err(Error::InvalidNumber { offset });
+            return Err(invalid_number(offset));
         };
         if let Some(a) = acc
             .checked_mul(16)
@@ -77,7 +111,7 @@ fn parse_hex(digits: &[u8], neg: bool, offset: usize) -> Result<Value<'static>> 
         }
     }
     if let Some(f) = wide {
-        return Ok(Value::F64(if neg {
+        return Ok(Num::F64(if neg {
             -f
         } else {
             f
@@ -86,37 +120,57 @@ fn parse_hex(digits: &[u8], neg: bool, offset: usize) -> Result<Value<'static>> 
     if neg {
         if acc <= TWO_POW_63 {
             // acc == 2^63 wraps to i64::MIN, whose negation is itself.
-            return Ok(Value::I64((acc as i64).wrapping_neg()));
+            return Ok(Num::I64((acc as i64).wrapping_neg()));
         }
     } else if acc <= U64_MAX {
-        return Ok(Value::U64(acc as u64));
+        return Ok(Num::U64(acc as u64));
     }
     let f = acc as f64;
-    Ok(Value::F64(if neg {
+    Ok(Num::F64(if neg {
         -f
     } else {
         f
     }))
 }
 
-/// Unsigned decimal per ECMAScript 5.1, sign already stripped.
-fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Value<'static>> {
-    let int_digits = count_digits(s, 0);
-    let mut i = int_digits;
+/// Unsigned decimal per ECMAScript 5.1, sign already stripped. One
+/// validating pass that also accumulates the integer digits; the frac/exp
+/// layout is read off the stop positions afterwards.
+fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Num> {
+    // Integer part: consume and accumulate in one pass. On overflow keep
+    // consuming (validation continues) and fall back to lib_parse below.
+    let mut i = 0;
+    let mut acc: u64 = 0;
+    let mut overflow = false;
+    while i < s.len() && s[i].is_ascii_digit() {
+        if !overflow {
+            let v = u64::from(s[i] - b'0');
+            if let Some(a) = acc.checked_mul(10).and_then(|a| a.checked_add(v)) {
+                acc = a;
+            } else {
+                overflow = true;
+            }
+        }
+        i += 1;
+    }
+    let int_digits = i;
     let mut frac_digits = 0;
     let mut had_dot = false;
     if s.get(i) == Some(&b'.') {
         had_dot = true;
         i += 1;
-        frac_digits = count_digits(s, i);
-        i += frac_digits;
+        let from = i;
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+        }
+        frac_digits = i - from;
         // `5.` and `.5` are valid; a lone `.` (or `.e3`) is not.
         if int_digits + frac_digits == 0 {
-            return Err(Error::InvalidNumber { offset });
+            return Err(invalid_number(offset));
         }
     } else if int_digits == 0 {
         // No digits and no dot: `e3`, empty, stray sign.
-        return Err(Error::InvalidNumber { offset });
+        return Err(invalid_number(offset));
     }
     let mut had_exp = false;
     if matches!(s.get(i), Some(&(b'e' | b'E'))) {
@@ -125,50 +179,45 @@ fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Value<'static>> {
             i += 1;
         }
         // `1e` and `1e+` are rejected.
-        let exp_digits = count_digits(s, i);
-        if exp_digits == 0 {
-            return Err(Error::InvalidNumber { offset });
+        let from = i;
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
         }
-        i += exp_digits;
+        if i == from {
+            return Err(invalid_number(offset));
+        }
         had_exp = true;
     }
     // The token is a maximal run, so any residue (`1a`, `1.2.3`) is invalid.
     if i != s.len() {
-        return Err(Error::InvalidNumber { offset });
+        return Err(invalid_number(offset));
     }
     if had_dot || had_exp {
         // Fraction layout facts come straight from the validation pass; no
         // second scan for the dot position.
         let leading_dot = int_digits == 0;
         let elided_frac = had_dot && frac_digits == 0;
-        return Ok(Value::F64(signed(
+        return Ok(Num::F64(signed(
             neg,
             float_value(s, leading_dot, elided_frac),
         )));
     }
     // Pure integer: keep the integer variant while the magnitude fits.
-    let mut acc: u64 = 0;
-    for &d in &s[..int_digits] {
-        let v = u64::from(d - b'0');
-        // Positive overflow past u64::MAX, or negative past i64::MIN.
-        acc = if let Some(a) = acc.checked_mul(10).and_then(|a| a.checked_add(v)) {
-            a
-        } else {
-            let f = lib_parse(s);
-            return Ok(Value::F64(signed(neg, f)));
-        };
+    if overflow {
+        let f = lib_parse(s);
+        return Ok(Num::F64(signed(neg, f)));
     }
     if !neg {
-        return Ok(Value::U64(acc));
+        return Ok(Num::U64(acc));
     }
     // -(acc) fits i64 iff acc <= 2^63; acc == 2^63 wraps to i64::MIN, whose
     // negation is itself.
     #[allow(clippy::cast_possible_wrap)]
     if acc <= (i64::MAX as u64) + 1 {
-        return Ok(Value::I64((acc as i64).wrapping_neg()));
+        return Ok(Num::I64((acc as i64).wrapping_neg()));
     }
     let f = lib_parse(s);
-    Ok(Value::F64(signed(neg, f)))
+    Ok(Num::F64(signed(neg, f)))
 }
 
 fn signed(neg: bool, f: f64) -> f64 {
@@ -177,11 +226,6 @@ fn signed(neg: bool, f: f64) -> f64 {
     } else {
         f
     }
-}
-
-/// Number of ASCII digits starting at `from`.
-fn count_digits(s: &[u8], from: usize) -> usize {
-    s[from..].iter().take_while(|b| b.is_ascii_digit()).count()
 }
 
 /// Evaluate an unsigned, grammar-validated decimal as f64. `leading_dot`
@@ -193,20 +237,47 @@ fn float_value(s: &[u8], leading_dot: bool, elided_frac: bool) -> f64 {
     if !leading_dot && !elided_frac {
         return lib_parse(s);
     }
-    let mut buf = Vec::with_capacity(s.len() + 1);
-    if leading_dot {
-        buf.push(b'0');
-    }
-    if elided_frac {
-        // A single dot with digits before it and none after: `5.` / `1.e3`.
-        let dot = s.iter().position(|&b| b == b'.').unwrap_or(0);
-        buf.extend_from_slice(&s[..=dot]);
-        buf.push(b'0');
-        buf.extend_from_slice(&s[dot + 1..]);
+    // The normalized form inserts one byte (`0`); at most one of the two
+    // flags can be set (`.` alone is rejected by the grammar). Legal tokens
+    // fit the 64-byte stack buffer; only overlong exponents spill to the
+    // heap.
+    debug_assert!(!(leading_dot && elided_frac));
+    if s.len() < 64 {
+        let mut buf = [0_u8; 64];
+        let mut n = 0;
+        if leading_dot {
+            buf[n] = b'0';
+            n += 1;
+        }
+        if elided_frac {
+            // A single dot with digits before it and none after: `5.` / `1.e3`.
+            let dot = s.iter().position(|&b| b == b'.').unwrap_or(0);
+            buf[n..=n + dot].copy_from_slice(&s[..=dot]);
+            n += dot + 1;
+            buf[n] = b'0';
+            n += 1;
+            buf[n..n + s.len() - dot - 1].copy_from_slice(&s[dot + 1..]);
+            n += s.len() - dot - 1;
+        } else {
+            buf[n..n + s.len()].copy_from_slice(s);
+            n += s.len();
+        }
+        lib_parse(&buf[..n])
     } else {
-        buf.extend_from_slice(s);
+        let mut buf = Vec::with_capacity(s.len() + 1);
+        if leading_dot {
+            buf.push(b'0');
+        }
+        if elided_frac {
+            let dot = s.iter().position(|&b| b == b'.').unwrap_or(0);
+            buf.extend_from_slice(&s[..=dot]);
+            buf.push(b'0');
+            buf.extend_from_slice(&s[dot + 1..]);
+        } else {
+            buf.extend_from_slice(s);
+        }
+        lib_parse(&buf)
     }
-    lib_parse(&buf)
 }
 
 fn lib_parse(s: &[u8]) -> f64 {
@@ -318,6 +389,10 @@ mod tests {
             num("9007199254740993.0"),
             Value::F64(9_007_199_254_740_992.0)
         );
+        // Leading-dot forms around the 64-byte stack-buffer boundary of
+        // float_value (one below, one at it) both normalize identically.
+        assert_eq!(num(&format!(".5e{}", "0".repeat(60))), Value::F64(0.5));
+        assert_eq!(num(&format!(".5e{}", "0".repeat(61))), Value::F64(0.5));
     }
 
     #[test]
@@ -366,5 +441,59 @@ mod tests {
         assert_eq!(parse(b"1a", 7).unwrap_err(), Error::InvalidNumber {
             offset: 7
         });
+    }
+
+    /// The DOM `parse` is a pure `parse_num` -> `Value` mapping; a mismatch
+    /// here would silently fork the DOM and serde number semantics.
+    #[test]
+    fn parse_matches_parse_num_mapping() {
+        for t in [
+            "0",
+            "-1",
+            "+1",
+            "-0",
+            "007",
+            "18446744073709551615",
+            "-9223372036854775808",
+            "18446744073709551616",
+            "0x1f",
+            "-0x10",
+            "0x1FFFFFFFFFFFFFFFF",
+            ".5",
+            "5.",
+            "1.e3",
+            "1.5",
+            "1e3",
+            "Infinity",
+            "-Infinity",
+            "NaN",
+        ] {
+            let n = parse_num(t.as_bytes(), 0).unwrap();
+            let mapped = match n {
+                Num::I64(i) => Value::I64(i),
+                Num::U64(u) => Value::U64(u),
+                Num::F64(f) => Value::F64(f),
+            };
+            // Debug renderings: F64(NaN) never equals itself.
+            assert_eq!(
+                format!("{:?}", parse(t.as_bytes(), 0).unwrap()),
+                format!("{mapped:?}"),
+                "token {t:?}"
+            );
+        }
+        assert!(matches!(parse_num(b"NaN", 0), Ok(Num::F64(f)) if f.is_nan()));
+    }
+
+    #[test]
+    fn num_start_covers_token_value_routing() {
+        // Every first byte `stage2::token_value` routes to the number parser,
+        // and no byte it routes to the literal/keyword arm; the serde fast
+        // path leans on this to match the slow path exactly.
+        for b in b"0123456789+-." {
+            assert!(is_num_start(*b));
+        }
+        for t in ["Infinity", "NaN", "true", "false", "null", "x", "_", "$"] {
+            assert!(!is_num_start(t.as_bytes()[0]), "token {t:?}");
+        }
     }
 }

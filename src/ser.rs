@@ -26,6 +26,10 @@ const SHORT_ESCAPES: [u8; 8] = *b"\x00\"\\btnfr";
 /// Class of an arbitrary C0 control byte that has no short escape.
 const CLASS_UNICODE: u8 = 8;
 
+/// Indent run for pretty mode: covers the first 64 levels (128 bytes); deeper
+/// indentation falls back to writing the remainder byte by byte.
+const SPACE_CACHE: [u8; 128] = [b' '; 128];
+
 const fn build_escape_table() -> [u8; 256] {
     let mut table = [0; 256];
     table[b'"' as usize] = 1;
@@ -45,6 +49,38 @@ const fn build_escape_table() -> [u8; 256] {
     table
 }
 
+/// Output target of [`Writer`]: an owned buffer (DOM and serde entry points)
+/// or a streaming formatter adapter (the `Display` impl).
+trait Sink {
+    fn push(&mut self, byte: u8);
+
+    fn extend(&mut self, bytes: &[u8]);
+}
+
+impl Sink for Vec<u8> {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte);
+    }
+
+    #[inline]
+    fn extend(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+impl<S: Sink + ?Sized> Sink for &mut S {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        (**self).push(byte);
+    }
+
+    #[inline]
+    fn extend(&mut self, bytes: &[u8]) {
+        (**self).extend(bytes);
+    }
+}
+
 /// Growable output buffer. Growth is amortized through `Vec` doubling; the
 /// writer never shrinks or reallocates per token.
 ///
@@ -52,25 +88,25 @@ const fn build_escape_table() -> [u8; 256] {
 /// [`crate::MAX_DEPTH`], so parser-produced values cannot overflow the stack;
 /// hand-built values deeper than that are the caller's responsibility (the
 /// same holds for `Drop` and `PartialEq` on the DOM).
-struct Writer {
-    buf: Vec<u8>,
+struct Writer<W: Sink = Vec<u8>> {
+    out: W,
     pretty: bool,
     indent: usize,
 }
 
-impl Writer {
+impl<W: Sink> Writer<W> {
     fn write_value(&mut self, value: &Value<'_>) {
         match value {
-            Value::Null => self.buf.extend_from_slice(b"null"),
-            Value::Bool(true) => self.buf.extend_from_slice(b"true"),
-            Value::Bool(false) => self.buf.extend_from_slice(b"false"),
+            Value::Null => self.out.extend(b"null"),
+            Value::Bool(true) => self.out.extend(b"true"),
+            Value::Bool(false) => self.out.extend(b"false"),
             Value::I64(n) => {
                 let mut buffer = itoa::Buffer::new();
-                self.buf.extend_from_slice(buffer.format(*n).as_bytes());
+                self.out.extend(buffer.format(*n).as_bytes());
             },
             Value::U64(n) => {
                 let mut buffer = itoa::Buffer::new();
-                self.buf.extend_from_slice(buffer.format(*n).as_bytes());
+                self.out.extend(buffer.format(*n).as_bytes());
             },
             Value::F64(n) => self.write_f64(*n),
             Value::Str(s) => self.write_escaped(s.as_str()),
@@ -80,7 +116,7 @@ impl Writer {
     }
 
     fn write_array(&mut self, items: &[Value<'_>]) {
-        self.buf.push(b'[');
+        self.out.push(b'[');
         let mut first = true;
         for item in items {
             self.before_item(&mut first);
@@ -90,7 +126,7 @@ impl Writer {
     }
 
     fn write_object(&mut self, members: &Map<'_>) {
-        self.buf.push(b'{');
+        self.out.push(b'{');
         let mut first = true;
         for (key, item) in members {
             self.before_item(&mut first);
@@ -109,7 +145,7 @@ impl Writer {
             *first = false;
             self.indent += 1;
         } else {
-            self.buf.push(b',');
+            self.out.push(b',');
         }
         self.newline_indent();
     }
@@ -121,14 +157,14 @@ impl Writer {
             self.indent -= 1;
             self.newline_indent();
         }
-        self.buf.push(close);
+        self.out.push(close);
     }
 
     /// `:` after a key, followed by a space in pretty mode.
     fn write_key_value_separator(&mut self) {
-        self.buf.push(b':');
+        self.out.push(b':');
         if self.pretty {
-            self.buf.push(b' ');
+            self.out.push(b' ');
         }
     }
 
@@ -138,7 +174,7 @@ impl Writer {
     // variants.
     #[cfg(feature = "serde")]
     fn begin_variant(&mut self, name: &str) {
-        self.buf.push(b'{');
+        self.out.push(b'{');
         self.indent += 1;
         self.newline_indent();
         self.write_escaped(name);
@@ -150,15 +186,20 @@ impl Writer {
     fn end_variant(&mut self) {
         self.indent -= 1;
         self.newline_indent();
-        self.buf.push(b'}');
+        self.out.push(b'}');
     }
 
     /// In pretty mode: newline plus two spaces per indent level. Compact mode:
     /// nothing.
     fn newline_indent(&mut self) {
         if self.pretty {
-            self.buf.push(b'\n');
-            self.buf.extend(core::iter::repeat_n(b' ', 2 * self.indent));
+            self.out.push(b'\n');
+            let width = 2 * self.indent;
+            let cached = width.min(SPACE_CACHE.len());
+            self.out.extend(&SPACE_CACHE[..cached]);
+            for _ in 0..width - cached {
+                self.out.push(b' ');
+            }
         }
     }
 
@@ -166,46 +207,206 @@ impl Writer {
     /// because it would emit `NaN`/`inf` otherwise.
     fn write_f64(&mut self, n: f64) {
         if n.is_nan() {
-            self.buf.extend_from_slice(b"NaN");
+            self.out.extend(b"NaN");
         } else if n.is_infinite() {
             let literal = if n.is_sign_negative() {
                 &b"-Infinity"[..]
             } else {
                 &b"Infinity"[..]
             };
-            self.buf.extend_from_slice(literal);
+            self.out.extend(literal);
         } else {
             let mut buffer = ryu::Buffer::new();
-            self.buf
-                .extend_from_slice(buffer.format_finite(n).as_bytes());
+            self.out.extend(buffer.format_finite(n).as_bytes());
+        }
+    }
+
+    /// Finite f32 values take ryu's f32 path: widening to f64 first would
+    /// print the shortest f64 representation of the widened value (`0.1f32`
+    /// as `0.10000000149011612`) instead of the shortest f32 one (`0.1`),
+    /// diverging from serde_json. Non-finite values keep the f64 literal
+    /// handling.
+    fn write_f32(&mut self, n: f32) {
+        if n.is_finite() {
+            let mut buffer = ryu::Buffer::new();
+            self.out.extend(buffer.format_finite(n).as_bytes());
+        } else {
+            self.write_f64(f64::from(n));
         }
     }
 
     fn write_escaped(&mut self, s: &str) {
-        self.buf.push(b'"');
+        self.out.push(b'"');
         let bytes = s.as_bytes();
         let mut start = 0;
-        for (i, &byte) in bytes.iter().enumerate() {
-            let class = ESCAPE[usize::from(byte)];
-            if class == 0 {
-                continue;
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            // SWAR pre-check on whole words: a word without any byte in
+            // {< 0x20, '"', '\\'} is copied as one slice when it is finally
+            // flushed. UTF-8 continuation bytes are >= 0x80, so the < 0x20
+            // test never trips mid-codepoint and words are safe to skip
+            // across. A flagged word falls back to the byte-wise pass below.
+            let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+            let dangerous = has_zero(w & 0xe0e0_e0e0_e0e0_e0e0)
+                | has_zero(w ^ 0x2222_2222_2222_2222)
+                | has_zero(w ^ 0x5c5c_5c5c_5c5c_5c5c);
+            if dangerous == 0 {
+                i += 8;
+            } else {
+                start = escape_range(&mut self.out, bytes, i, i + 8, start);
+                i += 8;
             }
-            self.buf.extend_from_slice(&bytes[start..i]);
-            self.buf.push(b'\\');
-            match class {
-                CLASS_UNICODE => {
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    self.buf.extend_from_slice(b"u00");
-                    self.buf.push(HEX[usize::from(byte >> 4)]);
-                    self.buf.push(HEX[usize::from(byte & 0x0f)]);
-                },
-                short => self.buf.push(SHORT_ESCAPES[usize::from(short)]),
-            }
-            start = i + 1;
         }
-        self.buf.extend_from_slice(&bytes[start..]);
-        self.buf.push(b'"');
+        start = escape_range(&mut self.out, bytes, i, bytes.len(), start);
+        self.out.extend(&bytes[start..]);
+        self.out.push(b'"');
     }
+}
+
+/// Nonzero in the high bit of every byte that is zero in `x`, the SWAR
+/// zero-byte test (`x - 0x01..` borrows through zero bytes). A byte flagged
+/// only by an incoming borrow sits above a true zero, so `== 0` is exact for
+/// "no dangerous byte" and false positives merely trigger the byte-wise
+/// fallback.
+const fn has_zero(x: u64) -> u64 {
+    x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
+}
+
+/// Byte-wise escape pass over `bytes[from..to]`, appending to `out` and
+/// returning the first offset not yet flushed (an escape at `i` flushes
+/// through `i`, so the new `start` is `i + 1`).
+fn escape_range<S: Sink + ?Sized>(
+    out: &mut S,
+    bytes: &[u8],
+    from: usize,
+    to: usize,
+    start: usize,
+) -> usize {
+    let mut start = start;
+    for i in from..to {
+        let byte = bytes[i];
+        let class = ESCAPE[usize::from(byte)];
+        if class == 0 {
+            continue;
+        }
+        out.extend(&bytes[start..i]);
+        out.push(b'\\');
+        match class {
+            CLASS_UNICODE => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.extend(b"u00");
+                out.push(HEX[usize::from(byte >> 4)]);
+                out.push(HEX[usize::from(byte & 0x0f)]);
+            },
+            short => out.push(SHORT_ESCAPES[usize::from(short)]),
+        }
+        start = i + 1;
+    }
+    start
+}
+
+/// Streaming sink for the `Display` impl: forwards serializer output to a
+/// formatter in fixed-size chunks instead of materializing the whole
+/// document. Chunks may split a multi-byte sequence; `flush` hands only
+/// complete sequences to `write_str`, keeping an incomplete tail buffered,
+/// so every `&str` passed to the formatter is valid without assuming chunk
+/// boundaries land between code points.
+pub(crate) struct FormatterSink<'f, 'a> {
+    f: &'f mut core::fmt::Formatter<'a>,
+    buf: [u8; 256],
+    len: usize,
+    failed: bool,
+}
+
+impl Sink for FormatterSink<'_, '_> {
+    fn push(&mut self, byte: u8) {
+        if self.len == self.buf.len() {
+            self.flush();
+        }
+        self.buf[self.len] = byte;
+        self.len += 1;
+    }
+
+    fn extend(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let take = core::cmp::min(bytes.len(), self.buf.len() - self.len);
+            self.buf[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+            self.len += take;
+            bytes = &bytes[take..];
+            if self.len == self.buf.len() {
+                self.flush();
+            }
+        }
+    }
+}
+
+impl<'f, 'a> FormatterSink<'f, 'a> {
+    pub(crate) fn new(f: &'f mut core::fmt::Formatter<'a>) -> Self {
+        Self {
+            f,
+            buf: [0; 256],
+            len: 0,
+            failed: false,
+        }
+    }
+
+    /// Write the longest complete-UTF-8 prefix of the buffer; an incomplete
+    /// trailing sequence stays buffered for the next chunk.
+    fn flush(&mut self) {
+        if self.failed {
+            return;
+        }
+        let complete: &str = match core::str::from_utf8(&self.buf[..self.len]) {
+            Ok(s) => s,
+            Err(e) => match core::str::from_utf8(&self.buf[..e.valid_up_to()]) {
+                // The buffer starts at a code-point boundary of a stream that
+                // is valid UTF-8 overall (see `write_bytes`), so the only
+                // possible error is a sequence cut at the buffer end; its
+                // bytes stay buffered for the next chunk.
+                Ok(prefix) if e.error_len().is_none() => prefix,
+                // Unreachable for this writer; fail the stream rather than
+                // emit invalid text.
+                _ => {
+                    self.failed = true;
+                    return;
+                },
+            },
+        };
+        if self.f.write_str(complete).is_err() {
+            self.failed = true;
+            return;
+        }
+        let written = complete.len();
+        self.buf.copy_within(written..self.len, 0);
+        self.len -= written;
+    }
+
+    /// Flush the final chunk; with the stream complete, the buffer drains
+    /// entirely.
+    pub(crate) fn finish(mut self) -> core::fmt::Result {
+        self.flush();
+        if self.failed || self.len != 0 {
+            Err(core::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Serialize `value` into `f` chunk by chunk (the `Display` path); the output
+/// is valid UTF-8 by construction (see [`write_bytes`]).
+pub(crate) fn write_streaming(
+    value: &Value<'_>,
+    f: &mut core::fmt::Formatter<'_>,
+) -> core::fmt::Result {
+    let mut sink = FormatterSink::new(f);
+    let mut writer = Writer {
+        out: &mut sink,
+        pretty: false,
+        indent: 0,
+    };
+    writer.write_value(value);
+    sink.finish()
 }
 
 /// Serialize into a byte buffer. The output is valid UTF-8 by construction:
@@ -214,12 +415,15 @@ impl Writer {
 /// escape is ASCII.
 fn write_bytes(value: &Value<'_>, pretty: bool) -> Vec<u8> {
     let mut writer = Writer {
-        buf: Vec::new(),
+        // serde_json's `to_vec` starts at 128 as well: covers small documents
+        // outright; a full-size hint is not available here (the DOM does not
+        // remember its source size), so larger outputs keep growing by doubling.
+        out: Vec::with_capacity(128),
         pretty,
         indent: 0,
     };
     writer.write_value(value);
-    writer.buf
+    writer.out
 }
 
 /// Serialize to compact JSON5 text.
@@ -289,14 +493,15 @@ pub(crate) mod serde_impls {
         T: ?Sized + Serialize,
     {
         let mut writer = Writer {
-            buf: Vec::new(),
+            // Same starting capacity as `write_bytes` / serde_json's `to_vec`.
+            out: Vec::with_capacity(128),
             pretty,
             indent: 0,
         };
         value.serialize(Serializer {
             writer: &mut writer,
         })?;
-        Ok(writer.buf)
+        Ok(writer.out)
     }
 
     /// The serde serializer. Errors abort the whole serialization; partial
@@ -338,38 +543,31 @@ pub(crate) mod serde_impls {
 
         fn serialize_i64(self, v: i64) -> Result<()> {
             let mut buffer = itoa::Buffer::new();
-            self.writer
-                .buf
-                .extend_from_slice(buffer.format(v).as_bytes());
+            self.writer.out.extend(buffer.format(v).as_bytes());
             Ok(())
         }
 
         fn serialize_u64(self, v: u64) -> Result<()> {
             let mut buffer = itoa::Buffer::new();
-            self.writer
-                .buf
-                .extend_from_slice(buffer.format(v).as_bytes());
+            self.writer.out.extend(buffer.format(v).as_bytes());
             Ok(())
         }
 
         fn serialize_i128(self, v: i128) -> Result<()> {
             let mut buffer = itoa::Buffer::new();
-            self.writer
-                .buf
-                .extend_from_slice(buffer.format(v).as_bytes());
+            self.writer.out.extend(buffer.format(v).as_bytes());
             Ok(())
         }
 
         fn serialize_u128(self, v: u128) -> Result<()> {
             let mut buffer = itoa::Buffer::new();
-            self.writer
-                .buf
-                .extend_from_slice(buffer.format(v).as_bytes());
+            self.writer.out.extend(buffer.format(v).as_bytes());
             Ok(())
         }
 
         fn serialize_f32(self, v: f32) -> Result<()> {
-            self.serialize_f64(f64::from(v))
+            self.writer.write_f32(v);
+            Ok(())
         }
 
         fn serialize_f64(self, v: f64) -> Result<()> {
@@ -378,10 +576,10 @@ pub(crate) mod serde_impls {
         }
 
         fn serialize_bool(self, v: bool) -> Result<()> {
-            self.writer.buf.extend_from_slice(if v {
-                b"true"
+            self.writer.out.extend(if v {
+                &b"true"[..]
             } else {
-                b"false"
+                &b"false"[..]
             });
             Ok(())
         }
@@ -413,7 +611,7 @@ pub(crate) mod serde_impls {
         }
 
         fn serialize_unit(self) -> Result<()> {
-            self.writer.buf.extend_from_slice(b"null");
+            self.writer.out.extend(b"null");
             Ok(())
         }
 
@@ -459,12 +657,12 @@ pub(crate) mod serde_impls {
         }
 
         fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq> {
-            self.writer.buf.push(b'[');
+            self.writer.out.push(b'[');
             Ok(self.seq_compound(false))
         }
 
         fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple> {
-            self.writer.buf.push(b'[');
+            self.writer.out.push(b'[');
             Ok(self.seq_compound(false))
         }
 
@@ -473,7 +671,7 @@ pub(crate) mod serde_impls {
             _name: &'static str,
             _len: usize,
         ) -> Result<Self::SerializeTupleStruct> {
-            self.writer.buf.push(b'[');
+            self.writer.out.push(b'[');
             Ok(self.seq_compound(false))
         }
 
@@ -486,12 +684,12 @@ pub(crate) mod serde_impls {
             _len: usize,
         ) -> Result<Self::SerializeTupleVariant> {
             self.writer.begin_variant(variant);
-            self.writer.buf.push(b'[');
+            self.writer.out.push(b'[');
             Ok(self.seq_compound(true))
         }
 
         fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap> {
-            self.writer.buf.push(b'{');
+            self.writer.out.push(b'{');
             Ok(self.map_compound(false))
         }
 
@@ -500,7 +698,7 @@ pub(crate) mod serde_impls {
             _name: &'static str,
             _len: usize,
         ) -> Result<Self::SerializeStruct> {
-            self.writer.buf.push(b'{');
+            self.writer.out.push(b'{');
             Ok(self.map_compound(false))
         }
 
@@ -513,7 +711,7 @@ pub(crate) mod serde_impls {
             _len: usize,
         ) -> Result<Self::SerializeStructVariant> {
             self.writer.begin_variant(variant);
-            self.writer.buf.push(b'{');
+            self.writer.out.push(b'{');
             Ok(self.map_compound(true))
         }
     }
@@ -968,6 +1166,11 @@ mod serde_tests {
             "340282366920938463463374607431768211455"
         );
         assert_eq!(compact(&(-1.5f32)), "-1.5");
+        // f32 takes ryu's f32 path: `0.1f32` stays `0.1`, not the widened
+        // `0.10000000149011612`.
+        assert_eq!(compact(&0.1f32), "0.1");
+        assert_eq!(compact(&f32::NAN), "NaN");
+        assert_eq!(compact(&f32::NEG_INFINITY), "-Infinity");
     }
 
     #[test]

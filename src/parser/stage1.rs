@@ -10,10 +10,10 @@
 //!     identifiers such as unquoted keys, `true`, `false`, `null`, `Infinity`, `NaN`). The
 //!     beginning of the input acts as a separator.
 //! - Separator bytes are: ASCII whitespace (`0x09..=0x0D`, `0x20`), structural bytes, quote bytes,
-//!   `/` (comment introducer), and Unicode whitespace (`U+0085`, `U+00A0`, `U+1680`,
-//!   `U+2000..=U+200A`, `U+2028`, `U+2029`, `U+202F`, `U+205F`, `U+3000`, `U+FEFF`). Unicode
-//!   whitespace is classified in a scalar slow path; every other non-ASCII byte is an ordinary
-//!   token byte (identifier character).
+//!   `/` (comment introducer), and Unicode whitespace (`U+00A0`, `U+1680`, `U+2000..=U+200A`,
+//!   `U+2028`, `U+2029`, `U+202F`, `U+205F`, `U+3000`, `U+FEFF`). Unicode whitespace is classified
+//!   in a scalar slow path; every other non-ASCII byte is an ordinary token byte (identifier
+//!   character).
 //! - Token bytes are the ASCII characters `A-Z a-z 0-9 $ _ + - . \` plus non-ASCII bytes that are
 //!   not Unicode whitespace. `\` is a token byte so that unquoted identifiers may contain `\uXXXX`
 //!   escapes (validated in stage 2); the escape never spans token boundaries because no separator
@@ -226,14 +226,15 @@ fn is_ascii_token_byte(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'$' | b'_' | b'+' | b'-' | b'.' | b'\\')
 }
 
-/// Unicode whitespace per the stage 1 contract. This is ECMAScript's
-/// `IsWhiteSpaceOrLineTerminator` set minus the ASCII range.
+/// Unicode whitespace per the stage 1 contract: the JSON5 WhiteSpace and
+/// LineTerminator sets minus the ASCII range (Zs, NBSP/BOM and LS/PS). NEL
+/// (`U+0085`) is category Cc, not Zs, and is not a JSON5 separator: like any
+/// other non-separator code point it continues a bare token.
 #[must_use]
 pub(crate) fn is_unicode_whitespace(cp: u32) -> bool {
     matches!(
         cp,
-        0x85 | 0xa0 | 0x1680 | 0x2000
-            ..=0x200a | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff
+        0xa0 | 0x1680 | 0x2000..=0x200a | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff
     )
 }
 

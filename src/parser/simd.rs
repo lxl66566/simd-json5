@@ -166,8 +166,9 @@ pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
 mod x86 {
     use core::arch::x86_64::{
         __m128i, __m256i, _mm_cmpeq_epi8, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8,
-        _mm_set1_epi8, _mm_xor_si128, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_loadu_si256,
-        _mm256_movemask_epi8, _mm256_set1_epi8, _mm256_xor_si256,
+        _mm_set1_epi8, _mm_xor_si128, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
+        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8, _mm256_setzero_si256,
+        _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_xor_si256,
     };
     use std::sync::OnceLock;
 
@@ -374,6 +375,91 @@ mod x86 {
                     | Self::eq_mask(block, b':')
             }
         }
+
+        /// Nibble-table classification (the simdjson scheme): one shuffle per
+        /// nibble replaces the 4 range + 13 eq compare chains, producing all
+        /// three masks in a handful of vector ops per 32-byte lane.
+        ///
+        /// Whitespace uses a self-match table: the entry a byte's low nibble
+        /// selects equals the byte itself exactly for the six whitespace
+        /// bytes (every filler value's own low nibble differs from its index,
+        /// so it can never compare equal); bytes `>= 0x80` shuffle to zero.
+        /// simdjson's table extended with VT (`0x0B`) and FF (`0x0C`) for
+        /// JSON5.
+        ///
+        /// Token and structural bytes come from two rectangle tables: each
+        /// bit b below owns one rectangle `H_b x L_b` (high-nibble set times
+        /// low-nibble set) of the target byte sets, and a byte's class is the
+        /// AND of the bits its two nibbles select:
+        ///
+        /// ```text
+        /// bit 0: h{2}   x l{4,B,D,E}    $ + - .
+        /// bit 1: h{3}   x l{0-9}        0-9
+        /// bit 2: h{4,6} x l{1-F}        A-O, a-o
+        /// bit 3: h{5}   x l{0-A,C,F}    P-Z, backslash, _
+        /// bit 4: h{7}   x l{0-A}        p-z
+        /// bit 5: h{5,7} x l{B,D}        [ ] { }
+        /// bit 6: h{2}   x l{C}          ,
+        /// bit 7: h{3}   x l{A}          :
+        /// ```
+        ///
+        /// Bits 0-4 mark token rectangles and bits 5-7 structural ones, so a
+        /// nonzero low-half byte means token and a nonzero top-three-bits
+        /// byte means structural. The rectangles are exact products, and the
+        /// 256-value exhaustive test below pins the tables to `CLASSES`.
+        #[inline(always)]
+        unsafe fn classify(block: Self::Block) -> (u64, u64, u64) {
+            static WS_LUT: [u8; 32] = [
+                0x20, 100, 100, 100, 17, 100, 113, 2, 100, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 100, 100,
+                0x20, 100, 100, 100, 17, 100, 113, 2, 100, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 100, 100,
+            ];
+            static LO_LUT: [u8; 32] = [
+                0x1a, 0x1e, 0x1e, 0x1e, 0x1f, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x9c, 0x25, 0x4c, 0x25,
+                0x05, 0x0c, 0x1a, 0x1e, 0x1e, 0x1e, 0x1f, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x9c, 0x25,
+                0x4c, 0x25, 0x05, 0x0c,
+            ];
+            static HI_LUT: [u8; 32] = [
+                0x00, 0x00, 0x41, 0x82, 0x04, 0x28, 0x04, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x41, 0x82, 0x04, 0x28, 0x04, 0x30, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ];
+            // SAFETY: register-only intrinsics except the three table loads,
+            // which are in-bounds 32-byte reads of immutable statics; the
+            // enabling kernel runs only after a successful AVX2 detection.
+            unsafe {
+                // SAFETY: in-bounds statics, as above.
+                let ws_lut = _mm256_loadu_si256(WS_LUT.as_ptr().cast());
+                let lo_lut = _mm256_loadu_si256(LO_LUT.as_ptr().cast());
+                let hi_lut = _mm256_loadu_si256(HI_LUT.as_ptr().cast());
+                let nibble = _mm256_set1_epi8(0x0f);
+                let tok_bits = _mm256_set1_epi8(0x1f);
+                let special_bits = _mm256_set1_epi8(0x07);
+                let zero = _mm256_setzero_si256();
+                let m = |v: __m256i| u64::from(_mm256_movemask_epi8(v) as u32);
+                let mut ws = 0_u64;
+                let mut tok = 0_u64;
+                let mut special = 0_u64;
+                for (i, v) in block.iter().enumerate() {
+                    let shift = 32 * i;
+                    // pshufb indexes by the low 4 bits, so the low-nibble
+                    // lookups need no masking.
+                    ws |= m(_mm256_cmpeq_epi8(*v, _mm256_shuffle_epi8(ws_lut, *v))) << shift;
+                    let cls = _mm256_and_si256(
+                        _mm256_shuffle_epi8(lo_lut, *v),
+                        _mm256_shuffle_epi8(
+                            hi_lut,
+                            _mm256_and_si256(_mm256_srli_epi16(*v, 4), nibble),
+                        ),
+                    );
+                    tok |= m(_mm256_cmpgt_epi8(_mm256_and_si256(cls, tok_bits), zero)) << shift;
+                    special |= m(_mm256_cmpgt_epi8(
+                        _mm256_and_si256(_mm256_srli_epi16(cls, 5), special_bits),
+                        zero,
+                    )) << shift;
+                }
+                (ws, tok, special)
+            }
+        }
     }
 
     /// Append structural offsets for `bytes` to `index` (AVX2 kernel).
@@ -479,6 +565,25 @@ trait Prims {
     ///
     /// The enabling ISA of the calling kernel must be available.
     unsafe fn structural_mask(block: Self::Block) -> u64;
+
+    /// Classify a block in one step: `(whitespace, token, structural)` masks,
+    /// where whitespace is exactly `0x09..=0x0D` and `0x20`. The default
+    /// composes the mask primitives above; backends with a cheaper scheme
+    /// (a nibble-table lookup, when the ISA has a byte shuffle) override it.
+    ///
+    /// # Safety
+    ///
+    /// The enabling ISA of the calling kernel must be available.
+    #[inline(always)]
+    #[allow(clippy::inline_always)] // load-bearing, see the Prims impls
+    unsafe fn classify(block: Self::Block) -> (u64, u64, u64) {
+        // SAFETY: caller guarantees the enabling ISA.
+        unsafe {
+            let ws = (Self::le_mask(block, 0x0d) & !Self::le_mask(block, 0x08))
+                | Self::eq_mask(block, b' ');
+            (ws, Self::token_mask(block), Self::structural_mask(block))
+        }
+    }
 }
 
 /// Vectorized string skip: returns the position just past the closing quote
@@ -499,8 +604,18 @@ unsafe fn skip_string_simd<O: Prims>(bytes: &[u8], open: usize) -> Result<usize>
         // SAFETY: register-only primitive ops.
         let bs = unsafe { O::eq_mask(block, b'\\') };
         let quotes = unsafe { O::eq_mask(block, quote) };
-        // A quote closes the string only when not escaped.
-        let closers = quotes & !odd_backslash_ends(bs, &mut ends_odd);
+        // A quote closes the string only when not escaped. With no
+        // backslashes in the block the parity chain degenerates: the only
+        // escape shadow is the carry-in on byte 0, and the carry always ends
+        // here (matches odd_backslash_ends on a zero mask), so the ~10-op
+        // chain is skipped for the common backslash-free block.
+        let closers = if bs == 0 {
+            let carried = u64::from(ends_odd);
+            ends_odd = false;
+            quotes & !carried
+        } else {
+            quotes & !odd_backslash_ends(bs, &mut ends_odd)
+        };
         if closers != 0 {
             return Ok(i + closers.trailing_zeros() as usize + 1);
         }
@@ -617,16 +732,12 @@ unsafe fn scan_simd<O: Prims>(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> 
         // SAFETY: loop guard guarantees 64 readable bytes at `pos`.
         let block = unsafe { O::load64(bytes, pos) };
         // SAFETY: register-only primitive ops. Whitespace is exactly
-        // 0x09..=0x0D and 0x20.
-        let ws = unsafe {
-            (O::le_mask(block, 0x0d) & !O::le_mask(block, 0x08)) | O::eq_mask(block, b' ')
-        };
+        // 0x09..=0x0D and 0x20; tok and special are the stage-1 token and
+        // structural byte sets (see CLASSES).
+        let (ws, tok, special) = unsafe { O::classify(block) };
         let mut attn = !ws; // attention bits: every non-whitespace byte
         let block_end = pos + 64;
         if attn != 0 {
-            // SAFETY: register-only primitive ops.
-            let special = unsafe { O::structural_mask(block) };
-            let tok = unsafe { O::token_mask(block) };
             // Push bits: structural bytes and token-run starts. A start is a
             // tok bit whose predecessor is not a token byte; adjacency in the
             // mask already encodes whitespace gaps, and a run continuing from
@@ -747,6 +858,16 @@ unsafe fn scan_simd<O: Prims>(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> 
                 }
             }
         }
+        // Whitespace at the block tail means the last byte before the
+        // boundary is not a token byte, so any token run broke before it.
+        // The `attn == 0` whole-whitespace block and the inner-loop exit on
+        // an exhausted attention mask skip the bit-63 recomputation above,
+        // leaving a stale carry that would swallow the next token's start.
+        // (`continue 'blocks` skips this on purpose: a skip that landed past
+        // the boundary already carries the class of its last consumed byte.)
+        if ws >> 63 & 1 != 0 {
+            in_token = false;
+        }
         pos = block_end;
     }
     // Finish the partial trailing block scalar, carrying the token-run state.
@@ -826,8 +947,8 @@ mod tests {
     fn token_starts_after_every_separator_kind() {
         // ASCII whitespace and Unicode whitespace separate runs.
         for sep in [
-            "\t", "\n", "\r", "\x0b", "\x0c", " ", "\u{85}", "\u{a0}", "\u{1680}", "\u{2000}",
-            "\u{200a}", "\u{2028}", "\u{2029}", "\u{202f}", "\u{205f}", "\u{3000}", "\u{feff}",
+            "\t", "\n", "\r", "\x0b", "\x0c", " ", "\u{a0}", "\u{1680}", "\u{2000}", "\u{200a}",
+            "\u{2028}", "\u{2029}", "\u{202f}", "\u{205f}", "\u{3000}", "\u{feff}",
         ] {
             let input = format!("a{sep}b");
             differential(input.as_bytes());
@@ -976,8 +1097,11 @@ mod tests {
 
     #[test]
     fn unicode_whitespace_and_non_whitespace_high_bytes() {
-        // Lookalikes that are NOT whitespace: single token runs.
-        for cp in [0x84u32, 0x200b, 0x200c, 0x200d, 0x2060, 0x2010, 0x180e] {
+        // Lookalikes that are NOT whitespace: single token runs. U+0085 (NEL)
+        // is Cc, not Zs: the JSON5 separator set excludes it.
+        for cp in [
+            0x85u32, 0x84, 0x200b, 0x200c, 0x200d, 0x2060, 0x2010, 0x180e,
+        ] {
             let ch = char::from_u32(cp).unwrap();
             let input = format!("a{ch}b");
             differential(input.as_bytes());
@@ -1001,7 +1125,7 @@ mod tests {
 
     #[test]
     fn unicode_whitespace_full() {
-        let mut cps: Vec<u32> = vec![0x85, 0xa0, 0x1680];
+        let mut cps: Vec<u32> = vec![0xa0, 0x1680];
         cps.extend(0x2000..=0x200a);
         cps.extend([0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]);
         for cp in cps {
@@ -1101,6 +1225,23 @@ mod tests {
             let ident = "\u{e9}".repeat(k);
             differential(format!("{ident} {ident}").as_bytes());
         }
+        // A whole-block whitespace run between tokens must not swallow the
+        // second token's start index (the `in_token` carry resets at the
+        // boundary): token block + pure-whitespace block + trailing token.
+        differential(format!("{}{}y", "x".repeat(64), " ".repeat(64)).as_bytes());
+        // Same with a partial second block: the high-bit sequence ends a
+        // block filled with exactly enough spaces to exhaust `attn`.
+        differential(format!("\u{e9}{}y", " ".repeat(62)).as_bytes());
+        // Mixed tab/newline whitespace blocks (different ws bytes, same run).
+        differential(format!("{}\t\ny", "\t\n".repeat(32)).as_bytes());
+        differential(format!("x{}\t\ny", "\t\n".repeat(32)).as_bytes());
+        // An odd-length backslash run ending a string-skip block (they start
+        // at open+1, so byte 64 here), then a backslash-free block: the
+        // escape carry must still shadow the next block's byte 0 even though
+        // the parity chain is skipped there; an even-length run must not.
+        differential(format!("\"{}\\\"{}\"y", "a".repeat(63), "b".repeat(62)).as_bytes());
+        differential(format!("\"{}\\\"{}", "a".repeat(63), "b".repeat(63)).as_bytes());
+        differential(format!("\"{}\\\\\"{}\"y", "a".repeat(62), "b".repeat(62)).as_bytes());
     }
 
     /// Random bytes from a JSON5-ish alphabet: hits accept paths, every error
@@ -1284,10 +1425,11 @@ mod tests {
         differential(&tok2);
     }
 
-    /// Exhaustive: every kernel's `token_mask` / `structural_mask` must agree
-    /// with the scalar `CLASSES` byte table for all 256 byte values (4 blocks
-    /// of 64). This is what catches lookalike bytes inside range tricks
-    /// (0x5C inside `[`..`]`, 0x7C inside `{`..=`}`).
+    /// Exhaustive: every kernel's `token_mask` / `structural_mask` /
+    /// `classify` must agree with the scalar `CLASSES` byte table (and the
+    /// exact whitespace set) for all 256 byte values (4 blocks of 64). This
+    /// is what catches lookalike bytes inside range tricks (0x5C inside
+    /// `[`..`]`, 0x7C inside `{`..=`}`) and nibble-table mistakes.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn masks_match_class_table() {
@@ -1296,22 +1438,31 @@ mod tests {
             *b = i as u8;
         }
         for start in (0..256).step_by(64) {
+            let ws_of = |b: usize| matches!(b, 0x09..=0x0d | 0x20);
             // SAFETY: SSE2 is the x86_64 baseline.
             let sse_block = unsafe { x86::Sse2::load64(&bytes, start) };
             // SAFETY: as above.
             let mut masks = vec![(
                 "sse2",
+                // SAFETY: as above.
                 unsafe { x86::Sse2::token_mask(sse_block) },
                 unsafe { x86::Sse2::structural_mask(sse_block) },
+                // SAFETY: as above.
+                unsafe { x86::Sse2::classify(sse_block) },
             )];
             if std::is_x86_feature_detected!("avx2") {
                 // SAFETY: guarded by the feature detection above.
                 let block = unsafe { x86::Avx2::load64(&bytes, start) };
-                masks.push(("avx2", unsafe { x86::Avx2::token_mask(block) }, unsafe {
-                    x86::Avx2::structural_mask(block)
-                }));
+                masks.push((
+                    "avx2",
+                    // SAFETY: guarded by the feature detection above.
+                    unsafe { x86::Avx2::token_mask(block) },
+                    unsafe { x86::Avx2::structural_mask(block) },
+                    // SAFETY: guarded by the feature detection above.
+                    unsafe { x86::Avx2::classify(block) },
+                ));
             }
-            for (label, tok, special) in masks {
+            for (label, tok, special, cls) in masks {
                 for i in 0..64 {
                     let b = start + i;
                     assert_eq!(
@@ -1323,6 +1474,22 @@ mod tests {
                         special & (1 << i) != 0,
                         CLASSES[b] & class::STRUCTURAL != 0,
                         "{label} structural: byte {b:#04x}"
+                    );
+                    let (cws, ctok, cspecial) = cls;
+                    assert_eq!(
+                        cws & (1 << i) != 0,
+                        ws_of(b),
+                        "{label} classify ws: byte {b:#04x}"
+                    );
+                    assert_eq!(
+                        ctok & (1 << i) != 0,
+                        CLASSES[b] & class::TOKEN != 0,
+                        "{label} classify token: byte {b:#04x}"
+                    );
+                    assert_eq!(
+                        cspecial & (1 << i) != 0,
+                        CLASSES[b] & class::STRUCTURAL != 0,
+                        "{label} classify structural: byte {b:#04x}"
                     );
                 }
             }

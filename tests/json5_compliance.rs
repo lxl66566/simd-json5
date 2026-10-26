@@ -80,7 +80,6 @@ fn accepted_documents() {
         (r#""😀""#, "\u{1f600}".into()),
         (r#""\uD83D\uDE00""#, "\u{1f600}".into()),
         (r#""a\qb""#, "aqb".into()),
-        (r#""\1\2""#, "12".into()),
         (r#""\0 ""#, "\0 ".into()),
         ("\"a\u{2028}b\u{2029}\"", "a\u{2028}b\u{2029}".into()),
         // Line continuations.
@@ -168,7 +167,6 @@ fn accepted_documents() {
         ("/* // */1", Value::U64(1)),
         ("//\n1", Value::U64(1)),
         // Unicode whitespace between tokens.
-        ("[1\u{85},2]", vec![Value::U64(1), Value::U64(2)].into()),
         ("\u{feff}1", Value::U64(1)),
         ("[1\u{a0}]", vec![Value::U64(1)].into()),
         ("{\u{2028}}", obj(vec![])),
@@ -368,6 +366,8 @@ fn rejected_documents() {
         }),
         // Invalid escapes inside strings.
         (r#""\01""#, Error::InvalidEscape { offset: 1 }),
+        (r#""\1\2""#, Error::InvalidEscape { offset: 1 }),
+        (r#""\9""#, Error::InvalidEscape { offset: 1 }),
         (r#""\x4""#, Error::InvalidEscape { offset: 1 }),
         (r#""\xZZ""#, Error::InvalidEscape { offset: 1 }),
         (r#""\u12""#, Error::InvalidUnicodeEscape { offset: 1 }),
@@ -380,6 +380,9 @@ fn rejected_documents() {
         // Invalid escapes inside identifiers.
         (r"{a\x41: 1}", Error::InvalidEscape { offset: 2 }),
         (r"{\uZZZZ: 1}", Error::InvalidUnicodeEscape { offset: 1 }),
+        // U+0085 (NEL) is Cc, not Zs: the JSON5 separator set excludes it,
+        // so it becomes part of the bare token and fails number parsing.
+        ("[1\u{85},2]", Error::InvalidNumber { offset: 1 }),
     ];
     for (src, want) in rejects {
         let got = simd_json5::from_str(src).unwrap_err();
