@@ -53,7 +53,7 @@ See the module doc in `src/parser/stage1.rs`; it is the authoritative copy. Summ
 
 - Output is strict JSON except: `NaN`, `Infinity`, `-Infinity` literals for non-finite f64.
 - Strings double-quoted, UTF-8 passthrough for bytes >= 0x20 except `"` and `\`; short escapes `\b \t \n \f \r`; other C0 controls as `\u00XX`. U+2028/U+2029 pass through raw (valid in both JSON and JSON5 strings).
-- Integers via `itoa`, floats via `ryu` (ryu writes `NaN`/`inf` — the writer must special-case them to the literals above).
+- Integers via `itoa`, floats via `zmij` (zmij writes `NaN`/`inf` — the writer must special-case them to the literals above).
 - Pretty printing: two-space indent, `": "` after keys, newline between items, exactly like `serde_json::to_string_pretty` on JSON-representable values.
 - No streaming public API yet: `to_string`/`to_string_pretty`/`to_vec` only.
 
@@ -77,7 +77,7 @@ Criterion suite in `benches/`. Corpora: `twitter.json`, `citm_catalog.json`, `ca
 
 ## Dependency pins
 
-Runtime: `indexmap`, `thiserror`, `itoa`, `ryu`, `memchr` (scalar string/comment scans), plus a float-parsing crate from the fast-float family (`fast-float` or `fast-float2`; pick by byte-slice partial-parse API fit, `#[no_std]` compatibility and maintenance; do not hand-roll the Eisel-Lemire algorithm). Optional: `serde`. Dev: `serde_json`, `rand`, `criterion`, the competitor parsers above.
+Runtime: `indexmap`, `thiserror`, `itoa`, `zmij`, `memchr` (scalar string/comment scans), plus a float-parsing crate from the fast-float family (`fast-float` or `fast-float2`; pick by byte-slice partial-parse API fit, `#[no_std]` compatibility and maintenance; do not hand-roll the Eisel-Lemire algorithm). Optional: `serde`. Dev: `serde_json`, `rand`, `criterion`, the competitor parsers above.
 
 ## Process rules
 

@@ -739,13 +739,13 @@ dependencies = [
  "json5",
  "memchr",
  "rand",
- "ryu",
  "serde",
  "serde_json",
  "serde_json5",
  "simd-json",
  "simdutf8",
  "thiserror",
+ "zmij",
 ]
 
 [[package]]

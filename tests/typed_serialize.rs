@@ -172,7 +172,7 @@ fn str_serialize() {
     assert_eq!(text, r#""s\tv""#);
 }
 
-/// f32 values take ryu's f32 shortest path, byte-identical to serde_json;
+/// f32 values take zmij's f32 shortest path, byte-identical to serde_json;
 /// widening to f64 first would print `0.1f32` as `0.10000000149011612`.
 #[test]
 fn f32_matches_serde_json_and_roundtrips() {
@@ -198,12 +198,6 @@ fn f32_matches_serde_json_and_roundtrips() {
     assert_eq!(typed::to_string(&f32::NEG_INFINITY).unwrap(), "-Infinity");
 }
 
-/// serde_json formats float exponents through the zmij fork (`1e+300`),
-/// while DESIGN pins our floats to ryu (`1e300`); normalize both sides.
-fn normalize_exponent(text: &str) -> String {
-    text.replace("e+", "e")
-}
-
 #[test]
 fn differential_against_serde_json_on_values() {
     let fixtures = vec![
@@ -214,15 +208,13 @@ fn differential_against_serde_json_on_values() {
         serde_json::json!({"esc": "a\"b\\c\n\t\u{7f}\u{2028}"}),
     ];
     for fixture in fixtures {
-        let expected = normalize_exponent(&serde_json::to_string(&fixture).unwrap());
         assert_eq!(
-            normalize_exponent(&typed::to_string(&fixture).unwrap()),
-            expected
+            typed::to_string(&fixture).unwrap(),
+            serde_json::to_string(&fixture).unwrap()
         );
-        let expected = normalize_exponent(&serde_json::to_string_pretty(&fixture).unwrap());
         assert_eq!(
-            normalize_exponent(&typed::to_string_pretty(&fixture).unwrap()),
-            expected
+            typed::to_string_pretty(&fixture).unwrap(),
+            serde_json::to_string_pretty(&fixture).unwrap()
         );
     }
 }

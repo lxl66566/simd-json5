@@ -203,7 +203,7 @@ impl<W: Sink> Writer<W> {
         }
     }
 
-    /// Non-finite floats use the JSON5 literals; ryu only sees finite values
+    /// Non-finite floats use the JSON5 literals; zmij only sees finite values
     /// because it would emit `NaN`/`inf` otherwise.
     fn write_f64(&mut self, n: f64) {
         if n.is_nan() {
@@ -216,19 +216,19 @@ impl<W: Sink> Writer<W> {
             };
             self.out.extend(literal);
         } else {
-            let mut buffer = ryu::Buffer::new();
+            let mut buffer = zmij::Buffer::new();
             self.out.extend(buffer.format_finite(n).as_bytes());
         }
     }
 
-    /// Finite f32 values take ryu's f32 path: widening to f64 first would
+    /// Finite f32 values take zmij's f32 path: widening to f64 first would
     /// print the shortest f64 representation of the widened value (`0.1f32`
     /// as `0.10000000149011612`) instead of the shortest f32 one (`0.1`),
     /// diverging from serde_json. Non-finite values keep the f64 literal
     /// handling.
     fn write_f32(&mut self, n: f32) {
         if n.is_finite() {
-            let mut buffer = ryu::Buffer::new();
+            let mut buffer = zmij::Buffer::new();
             self.out.extend(buffer.format_finite(n).as_bytes());
         } else {
             self.write_f64(f64::from(n));
@@ -1166,7 +1166,7 @@ mod serde_tests {
             "340282366920938463463374607431768211455"
         );
         assert_eq!(compact(&(-1.5f32)), "-1.5");
-        // f32 takes ryu's f32 path: `0.1f32` stays `0.1`, not the widened
+        // f32 takes zmij's f32 path: `0.1f32` stays `0.1`, not the widened
         // `0.10000000149011612`.
         assert_eq!(compact(&0.1f32), "0.1");
         assert_eq!(compact(&f32::NAN), "NaN");

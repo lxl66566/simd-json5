@@ -26,7 +26,7 @@ fn scalars() {
     assert_eq!(to_string(&Value::F64(-0.0)), "-0.0");
     assert_eq!(to_string(&Value::F64(2.0)), "2.0");
     assert_eq!(to_string(&Value::F64(0.15625)), "0.15625");
-    assert_eq!(to_string(&Value::F64(1e300)), "1e300");
+    assert_eq!(to_string(&Value::F64(1e300)), "1e+300");
     assert_eq!(to_string(&Value::F64(5e-324)), "5e-324");
 }
 
@@ -223,24 +223,13 @@ fn pretty_formatting() {
 #[test]
 fn pretty_matches_serde_json() {
     let value = sample();
-    let expected = normalize_exponent(&serde_json::to_string_pretty(&to_serde(&value)).unwrap());
-    assert_eq!(normalize_exponent(&to_string_pretty(&value)), expected);
-}
-
-/// serde_json >= 1.0.15x formats float exponents through the `zmij` fork of
-/// ryu, which writes an explicit plus (`1e+300`) where ryu writes `1e300`.
-/// DESIGN pins our floats to ryu, so the comparison normalizes the sign away
-/// on both sides instead.
-fn normalize_exponent(text: &str) -> String {
-    text.replace("e+", "e")
+    let expected = serde_json::to_string_pretty(&to_serde(&value)).unwrap();
+    assert_eq!(to_string_pretty(&value), expected);
 }
 
 #[test]
 fn compact_matches_serde_json() {
     let value = sample();
-    let expected = normalize_exponent(&serde_json::to_string(&to_serde(&value)).unwrap());
-    assert_eq!(
-        normalize_exponent(&String::from_utf8(to_vec(&value)).unwrap()),
-        expected
-    );
+    let expected = serde_json::to_string(&to_serde(&value)).unwrap();
+    assert_eq!(String::from_utf8(to_vec(&value)).unwrap(), expected);
 }

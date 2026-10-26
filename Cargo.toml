@@ -16,10 +16,10 @@ fearless_simd = "1.2"
 indexmap  = "2"
 itoa = "1.0.18"
 memchr = "2.8.3"
-ryu = "1.0.23"
 serde = { version = "1.0.229", optional = true }
 simdutf8 = "0.1.5"
 thiserror = "2"
+zmij = "1.0.23"
 
 [features]
 default = []
