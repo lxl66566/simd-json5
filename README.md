@@ -1,6 +1,6 @@
 # simd-json5
 
-Fastest JSON5 parser and serializer for Rust.
+Fastest JSON5 parser and serializer for Rust, with optional serde support.
 
 ## Benchmarks
 

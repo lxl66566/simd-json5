@@ -33,6 +33,7 @@ pub(crate) enum Num {
 /// `stage2::token_value` routes to [`parse_num`]. No bare identifier (`null`,
 /// `true`, keywords) can begin with one, so the serde fast path uses this to
 /// pick [`parse_num`] without the generic token classification.
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
 #[must_use]
 pub(crate) fn is_num_start(b: u8) -> bool {
     matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9')

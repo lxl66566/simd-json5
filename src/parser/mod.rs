@@ -35,10 +35,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Value<'_>> {
 /// Documents with fewer index entries return no table: no container in them
 /// can hold enough children to amortize a pre-allocation, so the pass and its
 /// allocation would be pure overhead.
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
 const MIN_COUNT_ENTRIES: usize = 8;
 
 /// Largest scratch buffer kept between parses, in elements (8 MiB of u32):
 /// one huge document must not pin memory for every later parse on the thread.
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
 const POOL_MAX_ELEMS: usize = 2 << 20;
 
 thread_local! {
@@ -53,8 +55,10 @@ thread_local! {
 /// The element-count hint table produced by [`container_counts`]. Recycles
 /// its buffer into the thread-local pool when dropped; a nested parse while
 /// the pool is borrowed simply takes a fresh buffer.
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
 pub(crate) struct Counts(Vec<u32>);
 
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
 impl Counts {
     pub(crate) fn as_slice(&self) -> &[u32] {
         &self.0
@@ -97,6 +101,7 @@ impl Drop for Counts {
 ///
 /// Scratch cost: 4 bytes per index entry plus the pass itself, which only
 /// classifies the byte at each entry — far cheaper than the parse.
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
 pub(crate) fn container_counts(bytes: &[u8], index: &[u32]) -> Counts {
     if index.len() < MIN_COUNT_ENTRIES {
         return Counts(Vec::new());
