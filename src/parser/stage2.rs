@@ -197,18 +197,33 @@ pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32], spans: &[Span]) -> Resul
                 },
             },
             b'"' | b'\'' => {
+                // A quoted string is a key only in key position; every other
+                // position is validated before parsing so a misplaced string
+                // reports the structural error instead of its own parse error
+                // (the serde path checks the state first too).
+                let is_key = matches!(
+                    stack.last(),
+                    Some(Frame::Object {
+                        state: ObjState::KeyOrClose,
+                        ..
+                    })
+                );
+                if !is_key {
+                    check_value_position(&stack, off)?;
+                }
                 let s = parse_string_spanned(bytes, off, &mut spans)?;
-                if let Some(Frame::Object {
-                    state, pending_key, ..
-                }) = stack.last_mut()
-                    && *state == ObjState::KeyOrClose
-                {
+                if is_key {
+                    let Some(Frame::Object {
+                        state, pending_key, ..
+                    }) = stack.last_mut()
+                    else {
+                        unreachable!("is_key implies an object frame");
+                    };
                     *state = ObjState::Colon;
                     *pending_key = Some(s);
-                    continue;
+                } else {
+                    deliver(&mut stack, &mut root, Value::Str(s));
                 }
-                check_value_position(&stack, off)?;
-                deliver(&mut stack, &mut root, Value::Str(s));
             },
             _ => {
                 if let Some(Frame::Object {
@@ -923,6 +938,12 @@ mod tests {
             byte: b':',
             offset: 0,
         });
+        // A misplaced string reports the structural error, not its own parse
+        // error: position is validated before the string body is parsed. The
+        // escapes are invalid (`\1`), so the string would fail on its own if
+        // it were parsed first.
+        assert_eq!(err(r"{a 'b\1': 1}"), syn("expected ':'", 3));
+        assert_eq!(err(r"[1 'b\1' 2]"), syn("expected ',' or ']'", 3));
     }
 
     #[test]

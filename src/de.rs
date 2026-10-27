@@ -1736,6 +1736,11 @@ mod tests {
             "{a",
             "[,",
             "{:,}",
+            // A misplaced string reports the structural error, not its own
+            // parse error (both paths validate position before parsing).
+            r"{a 'b\1': 1}",
+            "{a 'b",
+            r"[1 'b\1' 2]",
         ];
         for d in docs {
             assert_eq!(
