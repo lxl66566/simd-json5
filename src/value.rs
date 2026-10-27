@@ -2,6 +2,7 @@
 
 use core::{
     borrow::Borrow,
+    cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
     ops::Index,
@@ -55,6 +56,20 @@ impl Str<'_> {
 impl PartialEq for Str<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.as_str() == other.as_str()
+    }
+}
+
+/// Content ordering, consistent with the content-based [`PartialEq`] and
+/// [`Hash`]: the `Static`/`Dynamic` distinction never affects comparison.
+impl PartialOrd for Str<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Str<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
     }
 }
 
@@ -359,5 +374,30 @@ impl<'a> From<Map<'a>> for Value<'a> {
 impl fmt::Display for Value<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         crate::ser::write_streaming(self, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Str;
+
+    /// Ordering compares content regardless of the Static/Dynamic storage,
+    /// like the content-based equality and hash.
+    #[test]
+    fn str_order_across_variants() {
+        let mut mixed: Vec<Str<'_>> = ["apple", "banana", "cherry", "banana"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, word)| {
+                if i % 2 == 0 {
+                    Str::Static(word)
+                } else {
+                    Str::Dynamic(word.to_owned())
+                }
+            })
+            .collect();
+        mixed.sort();
+        let sorted: Vec<&str> = mixed.iter().map(Str::as_str).collect();
+        assert_eq!(sorted, ["apple", "banana", "banana", "cherry"]);
     }
 }

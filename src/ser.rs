@@ -1088,7 +1088,9 @@ pub(crate) mod serde_impls {
 
     /// The DOM serializes through the same wire format as
     /// [`crate::ser::to_string`]; routing it through any serde serializer
-    /// (including serde_json's) yields the identical DOM representation.
+    /// (including serde_json's) yields the identical DOM representation for
+    /// JSON-representable values. Non-finite floats differ: serde_json
+    /// renders them as `null`, this crate as the JSON5 literals.
     impl Serialize for Value<'_> {
         fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
         where
