@@ -160,6 +160,11 @@ fn float_text(rng: &mut Rng) -> String {
     } else {
         format!("{}.{mantissa}", digits(rng, 10))
     };
+    // Leading sign and exponent are independent draws, so the corpus also
+    // contains combinations like `-1.5e10`.
+    if rng.below(8) == 0 {
+        s = format!("-{s}");
+    }
     if rng.below(2) == 0 {
         let sign = if rng.below(2) == 0 {
             '+'
@@ -168,8 +173,6 @@ fn float_text(rng: &mut Rng) -> String {
         };
         let exp = rng.below(280);
         let _ = write!(s, "e{sign}{exp}");
-    } else if rng.below(8) == 0 {
-        s = format!("-{s}");
     }
     s
 }

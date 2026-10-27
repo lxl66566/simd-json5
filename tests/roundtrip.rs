@@ -107,6 +107,19 @@ fn roundtrip_escaped_strings() {
     );
 }
 
+/// Object keys take the same escape writer as string values; keys that
+/// contain escapes must survive the trip with their content intact.
+#[test]
+fn roundtrip_escaped_object_keys() {
+    assert_roundtrip(
+        r#"{"a\nb": 1, "tab\tkey": 2, "quote\"key": 3, "back\\slash": 4, "\u0007": 5}"#,
+    );
+    // U+2028/U+2029: legal raw in JSON5 strings, passed through unescaped by
+    // the serializer (escaped source form and raw source form alike).
+    assert_roundtrip("{\"\\u2028sep\\u2029\": 1}");
+    assert_roundtrip("{\"\u{2028}sep\u{2029}\": 1}");
+}
+
 #[test]
 fn roundtrip_integer_widths() {
     // Values at and beyond the i64/u64 boundaries become F64 on reparse only
