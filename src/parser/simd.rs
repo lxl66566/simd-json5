@@ -40,30 +40,21 @@
 #[cfg(target_arch = "x86_64")]
 use fearless_simd::{Avx2, Avx512, u8x32, u8x64};
 use fearless_simd::{Level, Simd, dispatch, prelude::*, u8x16};
-use memchr::{memchr, memchr2};
+use memchr::memchr;
 
 use super::stage1::{
-    CLASSES, class, decode_seq, is_unicode_whitespace, skip_comment, skip_string, token_end,
+    check_input_len, decode_seq, is_unicode_whitespace, scan_scalar, skip_string_tail,
 };
 use crate::{Error, Result};
-
-/// Reject inputs whose offsets do not fit `u32`; mirrors the canonical guard.
-fn check_input_len(bytes: &[u8]) -> Result<()> {
-    if bytes.len() > u32::MAX as usize {
-        return Err(Error::Syntax {
-            message: "input larger than 4 GiB is not supported".into(),
-            offset: 0,
-        });
-    }
-    Ok(())
-}
 
 /// Dispatch entry for the parser: selects the best kernel for the current
 /// CPU.
 ///
 /// - every SIMD level: the generic [`scan_simd`] kernel with the ISA's target features enabled by
 ///   `dispatch!`;
-/// - `Fallback`: the canonical scalar [`super::stage1::build_index`].
+/// - `Fallback`: the canonical scalar [`super::stage1::build_index`]. Its length check then runs
+///   twice (once here, once inside); the duplicate comparison is cheaper than forking the canonical
+///   entry.
 pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
     check_input_len(bytes)?;
     let level = Level::new();
@@ -379,29 +370,6 @@ fn classify_tables<S: Simd>(simd: S, blocks: [u8x16<S>; 4]) -> (u64, u64, u64) {
     (ws, tok, special)
 }
 
-/// Scalar string skip from `i` with an incoming escape-parity flag (used when
-/// the vector part of a skip ends mid-escape). Mirrors the canonical
-/// backslash-consumes-the-next-byte semantics.
-fn skip_string_tail(bytes: &[u8], open: usize, mut i: usize, mut escaped: bool) -> Result<usize> {
-    let quote = bytes[open];
-    // `i` may overshoot the end by one on a dangling escape; the empty
-    // search range then reports the string as unterminated.
-    while let Some(hit) = memchr2(quote, b'\\', &bytes[i.min(bytes.len())..]) {
-        let at = i + hit;
-        if escaped {
-            // The escaped byte is consumed whatever it is: it can neither
-            // close the string nor start a new escape.
-            escaped = false;
-            i = at + 1;
-        } else if bytes[at] == quote {
-            return Ok(at + 1);
-        } else {
-            i = at + 2; // the backslash consumes the byte after it
-        }
-    }
-    Err(Error::UnterminatedString { offset: open })
-}
-
 /// Vectorized string skip: returns the position just past the closing quote
 /// of the string opened at `open`, or the canonical unterminated error.
 #[inline(always)]
@@ -526,49 +494,6 @@ fn odd_backslash_ends(bs_bits: u64, ends_odd: &mut bool) -> u64 {
     let even_carry_ends = even_carries & !bs_bits;
     let odd_carry_ends = odd_carries & !bs_bits;
     (even_carry_ends & ODD_BITS) | (odd_carry_ends & EVEN_BITS)
-}
-
-/// Scalar scan mirroring the canonical stage-1 main loop from byte `i`, with
-/// an `in_token` carry so the SIMD kernels can hand off mid-token-run. When
-/// `in_token` is false the loop body is the canonical decision-point loop.
-#[allow(clippy::cast_possible_truncation)] // guarded by check_input_len
-fn scan_scalar(bytes: &[u8], mut i: usize, in_token: bool, index: &mut Vec<u32>) -> Result<()> {
-    if in_token {
-        // Finish the token run that the vector part started: consume it
-        // without emitting (its start was already emitted).
-        i = token_end(bytes, i);
-    }
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' | b'}' | b'[' | b']' | b',' | b':' => {
-                index.push(i as u32);
-                i += 1;
-            },
-            b'"' | b'\'' => {
-                index.push(i as u32);
-                i = skip_string(bytes, i)?;
-            },
-            b'/' => i = skip_comment(bytes, i)?,
-            b'\t'..=b'\r' | b' ' => i += 1,
-            0x80..=0xff => {
-                // Scalar slow path: classify the whole sequence before
-                // deciding. Structurally malformed input is rejected here.
-                let (cp, len) = decode_seq(bytes, i).ok_or(Error::InvalidUtf8 { offset: i })?;
-                if is_unicode_whitespace(cp) {
-                    i += len;
-                } else {
-                    index.push(i as u32);
-                    i = token_end(bytes, i);
-                }
-            },
-            b if CLASSES[b as usize] & class::TOKEN != 0 => {
-                index.push(i as u32);
-                i = token_end(bytes, i);
-            },
-            b => return Err(Error::UnexpectedChar { byte: b, offset: i }),
-        }
-    }
-    Ok(())
 }
 
 /// Generic 64-byte-block scan; `dispatch!` monomorphizes this for each ISA
@@ -734,7 +659,10 @@ mod tests {
     use fearless_simd::{Avx2, Sse2, Sse4_2};
 
     use super::*;
-    use crate::parser::stage1;
+    use crate::parser::{
+        stage1,
+        stage1::{CLASSES, class},
+    };
 
     type KernelFn = fn(&[u8], &mut Vec<u32>) -> Result<()>;
 

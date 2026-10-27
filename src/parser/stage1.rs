@@ -31,21 +31,44 @@ use memchr::{memchr, memchr2};
 
 use crate::{Error, Result};
 
-/// Append structural offsets for `bytes` to `index`.
-///
-/// Canonical scalar reference: the production path on targets with no
-/// supported vector ISA and the differential-test oracle for the SIMD
-/// kernels in [`super::simd`]; elsewhere the parser routes through the SIMD
-/// dispatch instead.
-#[allow(clippy::cast_possible_truncation)] // guarded by the length check below
-pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+/// Reject inputs whose offsets do not fit `u32`.
+pub(crate) fn check_input_len(bytes: &[u8]) -> Result<()> {
     if bytes.len() > u32::MAX as usize {
         return Err(Error::Syntax {
             message: "input larger than 4 GiB is not supported".into(),
             offset: 0,
         });
     }
-    let mut i = 0;
+    Ok(())
+}
+
+/// Append structural offsets for `bytes` to `index`.
+///
+/// Canonical scalar reference: the production path on targets with no
+/// supported vector ISA and the differential-test oracle for the SIMD
+/// kernels in [`super::simd`]; elsewhere the parser routes through the SIMD
+/// dispatch instead.
+pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+    check_input_len(bytes)?;
+    scan_scalar(bytes, 0, false, index)
+}
+
+/// The canonical scalar scan from byte `i`, with an `in_token` carry so the
+/// SIMD kernels can hand off mid-token-run at block boundaries. When
+/// `in_token` is false the loop body is the plain decision-point loop;
+/// callers enforce the 4 GiB length limit.
+#[allow(clippy::cast_possible_truncation)] // guarded by check_input_len in callers
+pub(crate) fn scan_scalar(
+    bytes: &[u8],
+    mut i: usize,
+    in_token: bool,
+    index: &mut Vec<u32>,
+) -> Result<()> {
+    if in_token {
+        // Finish the token run that the vector part started: consume it
+        // without emitting (its start was already emitted).
+        i = token_end(bytes, i);
+    }
     while i < bytes.len() {
         // Every arm leaves `i` on a decision point, so a token byte seen here
         // always starts a fresh token (token runs are consumed atomically).
@@ -70,7 +93,7 @@ pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
                     i = token_end(bytes, i);
                 }
             },
-            b if is_ascii_token_byte(b) => {
+            b if CLASSES[b as usize] & class::TOKEN != 0 => {
                 index.push(i as u32);
                 i = token_end(bytes, i);
             },
@@ -108,7 +131,7 @@ pub(crate) fn token_end(bytes: &[u8], start: usize) -> usize {
 /// [`CLASSES`]. One table lookup replaces a compare chain per byte.
 pub(crate) mod class {
     /// Stage-1 token byte: identifier characters, number characters and the
-    /// backslash (see [`super::is_ascii_token_byte`]).
+    /// backslash (the exact set marked `TOKEN` in [`CLASSES`]).
     pub const TOKEN: u8 = 0x01;
     /// Identifier continue byte `[A-Za-z0-9_$]`.
     pub const IDENT: u8 = 0x02;
@@ -173,16 +196,33 @@ const fn build_classes() -> [u8; 256] {
 /// Position just past the string whose opening quote is at `open`, honoring
 /// backslash escape parity. Escape contents are not validated here.
 pub(crate) fn skip_string(bytes: &[u8], open: usize) -> Result<usize> {
+    skip_string_tail(bytes, open, open + 1, false)
+}
+
+/// Scalar string skip from `i` with an incoming escape-parity flag (used
+/// when a vector skip ends mid-escape). Mirrors the canonical
+/// backslash-consumes-the-next-byte semantics.
+pub(crate) fn skip_string_tail(
+    bytes: &[u8],
+    open: usize,
+    mut i: usize,
+    mut escaped: bool,
+) -> Result<usize> {
     let quote = bytes[open];
     // `i` may overshoot the end by one on a dangling escape; the empty
     // search range then reports the string as unterminated.
-    let mut i = open + 1;
     while let Some(hit) = memchr2(quote, b'\\', &bytes[i.min(bytes.len())..]) {
         let at = i + hit;
-        if bytes[at] == quote {
+        if escaped {
+            // The escaped byte is consumed whatever it is: it can neither
+            // close the string nor start a new escape.
+            escaped = false;
+            i = at + 1;
+        } else if bytes[at] == quote {
             return Ok(at + 1);
+        } else {
+            i = at + 2; // the backslash consumes the byte after it
         }
-        i = at + 2; // the backslash consumes the byte after it
     }
     Err(Error::UnterminatedString { offset: open })
 }
@@ -217,12 +257,6 @@ pub(crate) fn skip_comment(bytes: &[u8], slash: usize) -> Result<usize> {
             offset: slash,
         }),
     }
-}
-
-/// ASCII token bytes: identifier characters, number characters and the
-/// backslash that may start a `\uXXXX` identifier escape.
-fn is_ascii_token_byte(b: u8) -> bool {
-    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'$' | b'_' | b'+' | b'-' | b'.' | b'\\')
 }
 
 /// Unicode whitespace per the stage 1 contract: the JSON5 WhiteSpace and
