@@ -40,16 +40,22 @@ fn bench_parse(c: &mut Criterion) {
         let text = corpus(name);
         let bytes = text.as_bytes().to_vec();
         let mut group = c.benchmark_group(format!("parse/{name}"));
-        group.sample_size(100);
         group.throughput(Throughput::Bytes(text.len() as u64));
 
         group.bench_function("simd-json5", |b| {
             b.iter(|| black_box(simd_json5::from_str(black_box(&text)).unwrap()));
         });
 
-        group.bench_function("json5", |b| {
-            b.iter(|| black_box(json5::from_str::<serde_json::Value>(black_box(&text)).unwrap()));
-        });
+        // `json5` is quadratic on canada.json's long float arrays (~65 s per
+        // parse; criterion needs >=10 samples), so it is only measured as a
+        // one-shot single sample via examples/one_shot.rs instead.
+        if name != "canada.json" {
+            group.bench_function("json5", |b| {
+                b.iter(|| {
+                    black_box(json5::from_str::<serde_json::Value>(black_box(&text)).unwrap())
+                });
+            });
+        }
 
         group.bench_function("serde-json5", |b| {
             b.iter(|| {
@@ -89,7 +95,6 @@ fn bench_parse(c: &mut Criterion) {
 /// `from_slice` adds whole-input UTF-8 validation on top of `from_str`.
 fn bench_slice(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse/slice");
-    group.sample_size(100);
     for (name, _) in CORPORA {
         let bytes = corpus(name).into_bytes();
         group.throughput(Throughput::Bytes(bytes.len() as u64));
@@ -106,7 +111,6 @@ fn bench_slice(c: &mut Criterion) {
 #[cfg(feature = "serde")]
 fn bench_typed(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse/typed");
-    group.sample_size(100);
     for (name, is_json) in CORPORA {
         let text = corpus(name);
         group.throughput(Throughput::Bytes(text.len() as u64));

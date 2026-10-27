@@ -36,7 +36,6 @@ fn bench_serialize(c: &mut Criterion) {
         let our_value = simd_json5::from_str(&text).unwrap();
 
         let mut group = c.benchmark_group(format!("serialize/{name}"));
-        group.sample_size(100);
         group.throughput(Throughput::Bytes(text.len() as u64));
 
         group.bench_function("simd-json5", |b| {
@@ -66,7 +65,6 @@ fn bench_serialize(c: &mut Criterion) {
 #[cfg(feature = "serde")]
 fn bench_typed(c: &mut Criterion) {
     let mut group = c.benchmark_group("serialize/typed");
-    group.sample_size(100);
     for (name, is_json) in CORPORA {
         let text = corpus(name);
         // Same DOM construction (and non-finite-to-Null distortion) as
