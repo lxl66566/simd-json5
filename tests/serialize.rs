@@ -148,18 +148,48 @@ impl std::fmt::Write for FailingWrite {
 }
 
 /// A formatter that fails mid-stream must surface `Err(fmt::Error)` from the
-/// `Display` impl instead of panicking (out-of-bounds `push`) or hanging
-/// (zero-progress `extend`) once the sink's buffer stays full. The document
-/// is far larger than the 256-byte streaming chunk, so the failing flush is
-/// hit early and every later write takes the failed path.
+/// `Display` impl instead of panicking or hanging once the sink's buffer
+/// stays full (`flush` leaves the buffer undrained on failure). Each document
+/// drives one of the three write shapes that can follow a failed flush:
+///
+/// - `array`: 1-byte extends alternating with pushes; the failing flush sits inside an `extend`,
+///   and every later `push` must take the failed early return instead of indexing the full buffer.
+/// - `string`: a single 1200-byte `extend` spanning several flushes, so the failure lands mid-chunk
+///   with bytes still left in it (a zero-progress loop would hang).
+/// - `panic path`: the output fills the buffer to exactly 256 bytes through pushes alone, so the
+///   next `push` flushes at entry; a failure there used to fall through to `buf[256]`.
 #[test]
 fn display_survives_formatter_failure() {
-    let value = Value::Array(vec![Value::I64(1); 600]);
-    assert!(to_string(&value).len() > 256);
-    for ok_calls in 0..4 {
-        let mut target = FailingWrite { ok_calls };
-        let result = write!(target, "{value}");
-        assert_eq!(result, Err(std::fmt::Error), "ok_calls = {ok_calls}");
+    let array = Value::Array(vec![Value::I64(1); 600]);
+    assert!(to_string(&array).len() > 256);
+    let string = Value::Str(Str::Dynamic("x".repeat(1200)));
+    // `[` plus the first member's `"xxx…x"` is exactly 256 bytes, so the `,`
+    // push after it flushes at entry. The tail members only pad the document
+    // past four 256-byte flushes so every budget in 0..4 fails.
+    let panic_path = Value::Array(
+        [
+            Value::Str(Str::Dynamic("x".repeat(253))),
+            Value::Str(Str::Static("")),
+        ]
+        .into_iter()
+        .chain((0..600).map(Value::I64))
+        .collect(),
+    );
+    assert!(to_string(&panic_path).len() > 1024);
+    for (label, value) in [
+        ("array", &array),
+        ("string", &string),
+        ("panic path", &panic_path),
+    ] {
+        for ok_calls in 0..4 {
+            let mut target = FailingWrite { ok_calls };
+            let result = write!(target, "{value}");
+            assert_eq!(
+                result,
+                Err(std::fmt::Error),
+                "{label}, ok_calls = {ok_calls}"
+            );
+        }
     }
 }
 

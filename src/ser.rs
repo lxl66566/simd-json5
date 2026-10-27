@@ -330,6 +330,9 @@ impl Sink for FormatterSink<'_, '_> {
         }
         if self.len == self.buf.len() {
             self.flush();
+            if self.failed {
+                return;
+            }
         }
         self.buf[self.len] = byte;
         self.len += 1;
@@ -348,6 +351,9 @@ impl Sink for FormatterSink<'_, '_> {
             bytes = &bytes[take..];
             if self.len == self.buf.len() {
                 self.flush();
+                if self.failed {
+                    return;
+                }
             }
         }
     }
