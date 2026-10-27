@@ -27,10 +27,10 @@
 //! 4. The final partial block is finished by the scalar tail ([`scan_scalar`]), carrying the
 //!    in-token flag across the handoff.
 //!
-//! All backends produce byte-identical index output and error values for the
-//! same input, down to the partial index contents left behind on error. The
-//! differential tests in this module enforce that against the canonical
-//! scalar implementation.
+//! All backends produce byte-identical index output, clean-string span
+//! tables and error values for the same input, down to the partial contents
+//! left behind on error. The differential tests in this module enforce that
+//! against the canonical scalar implementation.
 
 // inline(always) on the kernel and every helper is load-bearing: the generic
 // body must fold into the feature-enabled closure that `dispatch!` builds
@@ -43,7 +43,7 @@ use fearless_simd::{Level, Simd, dispatch, prelude::*, u8x16};
 use memchr::memchr;
 
 use super::stage1::{
-    check_input_len, decode_seq, is_unicode_whitespace, scan_scalar, skip_string_tail,
+    Span, check_input_len, decode_seq, is_unicode_whitespace, scan_scalar, skip_string_tail,
 };
 use crate::{Error, Result};
 
@@ -55,13 +55,13 @@ use crate::{Error, Result};
 /// - `Fallback`: the canonical scalar [`super::stage1::build_index`]. Its length check then runs
 ///   twice (once here, once inside); the duplicate comparison is cheaper than forking the canonical
 ///   entry.
-pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>, spans: &mut Vec<Span>) -> Result<()> {
     check_input_len(bytes)?;
     let level = Level::new();
     if level.is_fallback() {
-        return super::stage1::build_index(bytes, index);
+        return super::stage1::build_index(bytes, index, spans);
     }
-    dispatch!(level, simd => scan_simd(simd, bytes, index))
+    dispatch!(level, simd => scan_simd(simd, bytes, index, spans))
 }
 
 /// Mask of the bytes equal to `byte` in one 128-bit lane, in the low 16 bits.
@@ -114,6 +114,41 @@ fn pair_mask_native<S: Simd>(simd: S, bytes: &[u8], i: usize, first: u8, second:
         k += width;
     }
     (acc_first, acc_second)
+}
+
+/// Quadruple of equality masks over the 64 bytes at `i`: like
+/// [`pair_mask_native`] with four needles — one load per native block feeds
+/// all four compares (the string skip wants quote, backslash, LF and CR
+/// together). Callers guarantee 64 readable bytes at `i`.
+#[inline(always)]
+fn quad_mask_native<S: Simd>(
+    simd: S,
+    bytes: &[u8],
+    i: usize,
+    first: u8,
+    second: u8,
+    third: u8,
+    fourth: u8,
+) -> (u64, u64, u64, u64) {
+    let width = <S::u8s as SimdBase<S>>::LEN;
+    let needle_first = <S::u8s as SimdBase<S>>::splat(simd, first);
+    let needle_second = <S::u8s as SimdBase<S>>::splat(simd, second);
+    let needle_third = <S::u8s as SimdBase<S>>::splat(simd, third);
+    let needle_fourth = <S::u8s as SimdBase<S>>::splat(simd, fourth);
+    let mut acc_first = 0_u64;
+    let mut acc_second = 0_u64;
+    let mut acc_third = 0_u64;
+    let mut acc_fourth = 0_u64;
+    let mut k = 0;
+    while k < 64 {
+        let v = <S::u8s as SimdBase<S>>::from_slice(simd, &bytes[i + k..i + k + width]);
+        acc_first |= v.simd_eq(needle_first).to_bitmask() << k;
+        acc_second |= v.simd_eq(needle_second).to_bitmask() << k;
+        acc_third |= v.simd_eq(needle_third).to_bitmask() << k;
+        acc_fourth |= v.simd_eq(needle_fourth).to_bitmask() << k;
+        k += width;
+    }
+    (acc_first, acc_second, acc_third, acc_fourth)
 }
 
 /// Load 64 bytes at `i` as four 128-bit lanes, unaligned like the scalar
@@ -390,16 +425,24 @@ fn classify_tables<S: Simd>(simd: S, blocks: [u8x16<S>; 4]) -> (u64, u64, u64) {
     (ws, tok, special)
 }
 
-/// Vectorized string skip: returns the position just past the closing quote
-/// of the string opened at `open`, or the canonical unterminated error.
+/// Vectorized string skip: `(end, clean)` for the string opened at `open`,
+/// where `end` is the position just past the closing quote and `clean`
+/// marks content with no backslash and no LF/CR byte before it (the
+/// stage-1 span contract; escape parity is *not* applied to the LF/CR
+/// test — a line continuation's backslash disqualifies on its own, so the
+/// conservative answer is exact for clean strings by construction).
 #[inline(always)]
-fn skip_string_simd<S: Simd>(simd: S, bytes: &[u8], open: usize) -> Result<usize> {
+fn skip_string_simd<S: Simd>(simd: S, bytes: &[u8], open: usize) -> Result<(usize, bool)> {
     let quote = bytes[open];
     let len = bytes.len();
     let mut i = open + 1;
     let mut ends_odd = false;
+    let mut clean = true;
     while i + 64 <= len {
-        let (bs, quotes) = pair_mask_native(simd, bytes, i, b'\\', quote);
+        let (bs, quotes, lf, cr) = quad_mask_native(simd, bytes, i, b'\\', quote, b'\n', b'\r');
+        // Any backslash or line terminator before the closer disqualifies
+        // the span; bytes past the closer belong to following content.
+        let dirt = bs | lf | cr;
         // A quote closes the string only when not escaped. With no
         // backslashes in the block the parity chain degenerates: the only
         // escape shadow is the carry-in on byte 0, and the carry always ends
@@ -413,12 +456,15 @@ fn skip_string_simd<S: Simd>(simd: S, bytes: &[u8], open: usize) -> Result<usize
             quotes & !odd_backslash_ends(bs, &mut ends_odd)
         };
         if closers != 0 {
-            return Ok(i + closers.trailing_zeros() as usize + 1);
+            let t = closers.trailing_zeros() as usize;
+            clean &= dirt & ((1_u64 << t) - 1) == 0;
+            return Ok((i + t + 1, clean));
         }
+        clean &= dirt == 0;
         i += 64;
     }
-    // Scalar tail, carrying the pending escape parity.
-    skip_string_tail(bytes, open, i, ends_odd)
+    // Scalar tail, carrying the pending escape parity and cleanliness.
+    skip_string_tail(bytes, open, i, ends_odd, clean)
 }
 
 /// Vectorized comment skip mirroring [`skip_comment`].
@@ -519,7 +565,12 @@ fn odd_backslash_ends(bs_bits: u64, ends_odd: &mut bool) -> u64 {
 /// calls) must fold in through `#[inline(always)]`.
 #[allow(clippy::cast_possible_truncation)] // guarded by check_input_len
 #[inline(always)]
-fn scan_simd<S: Simd>(simd: S, bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+fn scan_simd<S: Simd>(
+    simd: S,
+    bytes: &[u8],
+    index: &mut Vec<u32>,
+    spans: &mut Vec<Span>,
+) -> Result<()> {
     debug_assert!(u32::try_from(bytes.len()).is_ok());
     let len = bytes.len();
     let mut pos = 0usize;
@@ -593,7 +644,14 @@ fn scan_simd<S: Simd>(simd: S, bytes: &[u8], index: &mut Vec<u32>) -> Result<()>
                     b'"' | b'\'' => {
                         index.push(p as u32);
                         in_token = false;
-                        skip_string_simd(simd, bytes, p)?
+                        let (jump, clean) = skip_string_simd(simd, bytes, p)?;
+                        if clean {
+                            spans.push(Span {
+                                open: p as u32,
+                                close: (jump - 1) as u32,
+                            });
+                        }
+                        jump
                     },
                     b'/' => {
                         in_token = false;
@@ -663,7 +721,7 @@ fn scan_simd<S: Simd>(simd: S, bytes: &[u8], index: &mut Vec<u32>) -> Result<()>
         pos = block_end;
     }
     // Finish the partial trailing block scalar, carrying the token-run state.
-    scan_scalar(bytes, pos, in_token, index)
+    scan_scalar(bytes, pos, in_token, index, spans)
 }
 
 #[cfg(test)]
@@ -682,43 +740,43 @@ mod tests {
         stage1::{CLASSES, class},
     };
 
-    type KernelFn = fn(&[u8], &mut Vec<u32>) -> Result<()>;
+    type KernelFn = fn(&[u8], &mut Vec<u32>, &mut Vec<Span>) -> Result<()>;
 
     /// Per level: classification masks from every strategy.
     type Strategies = Vec<(&'static str, (u64, u64, u64))>;
 
-    fn scan_fallback(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
-        dispatch!(Level::fallback(), simd => scan_simd(simd, bytes, index))
+    fn scan_fallback(bytes: &[u8], index: &mut Vec<u32>, spans: &mut Vec<Span>) -> Result<()> {
+        dispatch!(Level::fallback(), simd => scan_simd(simd, bytes, index, spans))
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn scan_sse2(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+    fn scan_sse2(bytes: &[u8], index: &mut Vec<u32>, spans: &mut Vec<Span>) -> Result<()> {
         // SAFETY: SSE2 (with sse/fxsr) is the x86_64 baseline.
-        dispatch!(Level::Sse2(unsafe { Sse2::assume_supported() }), simd => scan_simd(simd, bytes, index))
+        dispatch!(Level::Sse2(unsafe { Sse2::assume_supported() }), simd => scan_simd(simd, bytes, index, spans))
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn scan_sse4_2(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+    fn scan_sse4_2(bytes: &[u8], index: &mut Vec<u32>, spans: &mut Vec<Span>) -> Result<()> {
         // SAFETY: pushed into `kernels()` only after detecting every feature
         // this token requires.
-        dispatch!(Level::Sse4_2(unsafe { Sse4_2::assume_supported() }), simd => scan_simd(simd, bytes, index))
+        dispatch!(Level::Sse4_2(unsafe { Sse4_2::assume_supported() }), simd => scan_simd(simd, bytes, index, spans))
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn scan_avx2(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+    fn scan_avx2(bytes: &[u8], index: &mut Vec<u32>, spans: &mut Vec<Span>) -> Result<()> {
         // SAFETY: pushed into `kernels()` only after detecting every feature
         // this token requires.
-        dispatch!(Level::Avx2(unsafe { Avx2::assume_supported() }), simd => scan_simd(simd, bytes, index))
+        dispatch!(Level::Avx2(unsafe { Avx2::assume_supported() }), simd => scan_simd(simd, bytes, index, spans))
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn scan_neon(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+    fn scan_neon(bytes: &[u8], index: &mut Vec<u32>, spans: &mut Vec<Span>) -> Result<()> {
         // SAFETY: NEON is the aarch64 baseline.
-        dispatch!(Level::Neon(unsafe { Neon::assume_supported() }), simd => scan_simd(simd, bytes, index))
+        dispatch!(Level::Neon(unsafe { Neon::assume_supported() }), simd => scan_simd(simd, bytes, index, spans))
     }
 
-    fn scan_dispatched(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
-        build_index(bytes, index)
+    fn scan_dispatched(bytes: &[u8], index: &mut Vec<u32>, spans: &mut Vec<Span>) -> Result<()> {
+        build_index(bytes, index, spans)
     }
 
     /// All kernels available on this machine, including the dispatch entry.
@@ -755,14 +813,16 @@ mod tests {
     }
 
     /// The core differential: every kernel must agree with the canonical
-    /// scalar stage 1 on both the result and the full index contents
-    /// (including the partial contents left behind on error).
+    /// scalar stage 1 on both the result and the full index and span-table
+    /// contents (including the partial contents left behind on error).
     fn differential(bytes: &[u8]) {
         let mut oracle = Vec::new();
-        let expected = stage1::build_index(bytes, &mut oracle);
+        let mut oracle_spans = Vec::new();
+        let expected = stage1::build_index(bytes, &mut oracle, &mut oracle_spans);
         for (label, kernel) in kernels() {
             let mut got = Vec::new();
-            let result = kernel(bytes, &mut got);
+            let mut got_spans = Vec::new();
+            let result = kernel(bytes, &mut got, &mut got_spans);
             assert!(
                 result == expected,
                 "{label}: result {result:?} != oracle {expected:?} for {bytes:02x?}"
@@ -771,20 +831,24 @@ mod tests {
                 got == oracle,
                 "{label}: index {got:?} != oracle {oracle:?} for {bytes:02x?}"
             );
+            assert!(
+                got_spans == oracle_spans,
+                "{label}: spans {got_spans:?} != oracle {oracle_spans:?} for {bytes:02x?}"
+            );
         }
     }
 
     /// Dispatched index for a valid input.
     fn idx(bytes: &[u8]) -> Vec<u32> {
         let mut v = Vec::new();
-        build_index(bytes, &mut v).unwrap();
+        build_index(bytes, &mut v, &mut Vec::new()).unwrap();
         v
     }
 
     /// Dispatched error for an invalid input.
     fn err(bytes: &[u8]) -> Error {
         let mut v = Vec::new();
-        build_index(bytes, &mut v).unwrap_err()
+        build_index(bytes, &mut v, &mut Vec::new()).unwrap_err()
     }
 
     #[test]
@@ -932,7 +996,7 @@ mod tests {
         }
         // Partial index contents on error match the canonical scalar.
         let mut got = Vec::new();
-        assert!(build_index(b"a!", &mut got).is_err());
+        assert!(build_index(b"a!", &mut got, &mut Vec::new()).is_err());
         assert_eq!(got, vec![0]);
     }
 
@@ -1146,7 +1210,7 @@ mod tests {
                 .map(|_| pool[rng.random_range(0..pool.len())])
                 .collect();
             let mut probe = Vec::new();
-            if stage1::build_index(&input, &mut probe).is_ok() {
+            if stage1::build_index(&input, &mut probe, &mut Vec::new()).is_ok() {
                 ok_seen += 1;
             } else {
                 err_seen += 1;

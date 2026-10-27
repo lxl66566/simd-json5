@@ -40,8 +40,12 @@ pub(crate) fn initial_index_capacity(len: usize) -> usize {
 /// `Error::InvalidUtf8`. Debug builds assert the contract at every slice.
 pub(crate) fn parse(bytes: &[u8]) -> Result<Value<'_>> {
     let mut index = Vec::with_capacity(initial_index_capacity(bytes.len()));
-    simd::build_index(bytes, &mut index)?;
-    stage2::build(bytes, &index)
+    // No pre-allocation: spans grow amortized and number-heavy documents
+    // would waste it (a string contributes at most one span but at least one
+    // index entry, so the index estimate bounds the waste).
+    let mut spans = Vec::new();
+    simd::build_index(bytes, &mut index, &mut spans)?;
+    stage2::build(bytes, &index, &spans)
 }
 
 /// Documents with fewer index entries return no table: no container in them
@@ -167,7 +171,7 @@ mod tests {
 
     fn counts(src: &str) -> super::Counts {
         let mut index = Vec::new();
-        build_index(src.as_bytes(), &mut index).unwrap();
+        build_index(src.as_bytes(), &mut index, &mut Vec::new()).unwrap();
         container_counts(src.as_bytes(), &index)
     }
 

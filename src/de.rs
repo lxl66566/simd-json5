@@ -33,7 +33,7 @@ use crate::{
         container_counts, initial_index_capacity,
         number::{self, Num},
         simd,
-        stage1::{CLASSES, class, token_end},
+        stage1::{CLASSES, Span, class, token_end},
         stage2,
     },
     value::{MAX_DEPTH, Map, Str, Value},
@@ -46,9 +46,10 @@ where
     T: serde::Deserialize<'de>,
 {
     let mut index = Vec::with_capacity(initial_index_capacity(s.len()));
-    simd::build_index(s.as_bytes(), &mut index)?;
+    let mut spans = Vec::new();
+    simd::build_index(s.as_bytes(), &mut index, &mut spans)?;
     let counts = container_counts(s.as_bytes(), &index);
-    let mut de = Deserializer::new(s.as_bytes(), &index, counts.as_slice());
+    let mut de = Deserializer::new(s.as_bytes(), &index, counts.as_slice(), &spans);
     let value = T::deserialize(&mut de).map_err(|e| locate(e, &de))?;
     de.end()?;
     Ok(value)
@@ -132,6 +133,10 @@ fn syntax(message: &str, offset: usize) -> Error {
 struct Deserializer<'a, 'de> {
     bytes: &'de [u8],
     index: &'a [u32],
+    /// Clean-string spans of stage 1, in opening-offset order; the head is
+    /// consumed whenever the string it records is parsed (see
+    /// [`stage2::parse_string_spanned`]).
+    spans: &'a [Span],
     /// Child-count hints keyed by index position of each container opening
     /// (see [`container_counts`]); consulted by the `size_hint` overrides of
     /// [`SeqAccess`] and [`MapAccess`] only.
@@ -147,16 +152,24 @@ struct Deserializer<'a, 'de> {
 }
 
 impl<'a, 'de> Deserializer<'a, 'de> {
-    fn new(bytes: &'de [u8], index: &'a [u32], counts: &'a [u32]) -> Self {
+    fn new(bytes: &'de [u8], index: &'a [u32], counts: &'a [u32], spans: &'a [Span]) -> Self {
         Self {
             bytes,
             index,
+            spans,
             counts,
             pos: 0,
             depth: 0,
             ctx: Ctx::Top,
             started: false,
         }
+    }
+
+    /// String value at the quote entry `off`: borrowed straight from the
+    /// clean stage-1 span when its head matches, the full validating parse
+    /// otherwise.
+    fn string(&mut self, off: usize) -> Result<Str<'de>> {
+        stage2::parse_string_spanned(self.bytes, off, &mut self.spans)
     }
 
     /// Entry offset the cursor stands on, or end of input for EOF errors.
@@ -210,7 +223,7 @@ impl<'a, 'de> Deserializer<'a, 'de> {
         };
         match b {
             b'"' | b'\'' => {
-                let (s, _) = stage2::parse_string(self.bytes, off)?;
+                let s = self.string(off)?;
                 self.bump();
                 Ok(Value::Str(s))
             },
@@ -244,7 +257,7 @@ impl<'a, 'de> Deserializer<'a, 'de> {
         match self.peek_byte() {
             Some(b'"' | b'\'') => {
                 let off = self.offset();
-                let (s, _) = stage2::parse_string(self.bytes, off)?;
+                let s = self.string(off)?;
                 self.bump();
                 match s {
                     Str::Static(s) => visitor.visit_borrowed_bytes(s.as_bytes()),
@@ -501,7 +514,7 @@ impl<'a, 'de> Deserializer<'a, 'de> {
         let off = self.offset();
         match b {
             b'"' | b'\'' => {
-                let (s, _) = stage2::parse_string(self.bytes, off)?;
+                let s = self.string(off)?;
                 self.bump();
                 Ok(s)
             },
@@ -596,7 +609,7 @@ impl<'a, 'de> Deserializer<'a, 'de> {
                 r
             },
             b'"' | b'\'' => {
-                stage2::parse_string(self.bytes, off)?;
+                self.string(off)?;
                 self.bump();
                 Ok(())
             },
@@ -1565,7 +1578,7 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
         match self.peek_byte() {
             Some(b'"' | b'\'') => {
                 let off = self.offset();
-                let (variant, _) = stage2::parse_string(self.bytes, off)?;
+                let variant = self.string(off)?;
                 self.bump();
                 visitor.visit_enum(UnitVariantAccess { variant })
             },

@@ -26,10 +26,25 @@
 //!   - unterminated string or comment.
 //! - Inside strings stage 1 only locates the closing quote, honoring backslash escapes; escape
 //!   validation happens in stage 2.
+//! - Side table: for every *clean* string — one whose bytes strictly between the quotes contain no
+//!   backslash and no raw LF/CR — one `Span { open, close }` is appended to `spans`, recording the
+//!   opening- and closing-quote offsets in ascending `open` order. Stage 2 borrows a spanned
+//!   string's content directly instead of re-scanning it; a string without a span takes the full
+//!   validating parse, so an over-conservative dirty marking is only slower, never wrong.
 
 use memchr::{memchr, memchr2};
 
 use crate::{Error, Result};
+
+/// A clean string recorded by stage 1 (see the module contract): the string
+/// opening at `open` closes at `close` (both quote offsets), and the content
+/// `bytes[open + 1..close]` contains no backslash and no raw LF/CR — exactly
+/// the strings whose stage-2 parse reduces to borrowing that slice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Span {
+    pub(crate) open: u32,
+    pub(crate) close: u32,
+}
 
 /// Reject inputs whose offsets do not fit `u32`.
 pub(crate) fn check_input_len(bytes: &[u8]) -> Result<()> {
@@ -42,15 +57,16 @@ pub(crate) fn check_input_len(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Append structural offsets for `bytes` to `index`.
+/// Append structural offsets for `bytes` to `index` and clean-string spans to
+/// `spans`.
 ///
 /// Canonical scalar reference: the production path on targets with no
 /// supported vector ISA and the differential-test oracle for the SIMD
 /// kernels in [`super::simd`]; elsewhere the parser routes through the SIMD
 /// dispatch instead.
-pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>) -> Result<()> {
+pub(crate) fn build_index(bytes: &[u8], index: &mut Vec<u32>, spans: &mut Vec<Span>) -> Result<()> {
     check_input_len(bytes)?;
-    scan_scalar(bytes, 0, false, index)
+    scan_scalar(bytes, 0, false, index, spans)
 }
 
 /// The canonical scalar scan from byte `i`, with an `in_token` carry so the
@@ -63,6 +79,7 @@ pub(crate) fn scan_scalar(
     mut i: usize,
     in_token: bool,
     index: &mut Vec<u32>,
+    spans: &mut Vec<Span>,
 ) -> Result<()> {
     if in_token {
         // Finish the token run that the vector part started: consume it
@@ -79,7 +96,14 @@ pub(crate) fn scan_scalar(
             },
             b'"' | b'\'' => {
                 index.push(i as u32);
-                i = skip_string(bytes, i)?;
+                let (end, clean) = skip_string(bytes, i)?;
+                if clean {
+                    spans.push(Span {
+                        open: i as u32,
+                        close: (end - 1) as u32,
+                    });
+                }
+                i = end;
             },
             b'/' => i = skip_comment(bytes, i)?,
             b'\t'..=b'\r' | b' ' => i += 1,
@@ -193,28 +217,38 @@ const fn build_classes() -> [u8; 256] {
     t
 }
 
-/// Position just past the string whose opening quote is at `open`, honoring
-/// backslash escape parity. Escape contents are not validated here.
-pub(crate) fn skip_string(bytes: &[u8], open: usize) -> Result<usize> {
-    skip_string_tail(bytes, open, open + 1, false)
+/// Position just past the string whose opening quote is at `open`, with its
+/// cleanliness flag; see [`skip_string_tail`].
+pub(crate) fn skip_string(bytes: &[u8], open: usize) -> Result<(usize, bool)> {
+    skip_string_tail(bytes, open, open + 1, false, true)
 }
 
 /// Scalar string skip from `i` with an incoming escape-parity flag (used
-/// when a vector skip ends mid-escape). Mirrors the canonical
-/// backslash-consumes-the-next-byte semantics.
+/// when a vector skip ends mid-escape), returning `(end, clean)`: `end` is
+/// just past the closing quote, and `clean` (carried in, carried out) marks
+/// content with neither a backslash nor an LF/CR byte so far. A clean string
+/// needs no escape validation and no terminator re-check, so stage 2 can use
+/// the recorded extent instead of re-scanning. The test is conservative —
+/// an escaped LF (line continuation) also clears it, costing only the fast
+/// path.
+///
+/// Mirrors the canonical backslash-consumes-the-next-byte semantics.
 pub(crate) fn skip_string_tail(
     bytes: &[u8],
     open: usize,
     mut i: usize,
     mut escaped: bool,
-) -> Result<usize> {
+    mut clean: bool,
+) -> Result<(usize, bool)> {
     let quote = bytes[open];
     loop {
         if escaped {
             // The pending backslash (the vector part's last byte) consumes
             // exactly the byte at `i`, whatever it is. When that target is
             // not itself a quote or backslash, the next hit below belongs to
-            // the string proper and must not be swallowed with it.
+            // the string proper and must not be swallowed with it. (A
+            // pending escape implies a backslash in the vector part, which
+            // already cleared `clean` there.)
             escaped = false;
             i += 1;
         }
@@ -224,9 +258,16 @@ pub(crate) fn skip_string_tail(
             return Err(Error::UnterminatedString { offset: open });
         };
         let at = i + hit;
-        if bytes[at] == quote {
-            return Ok(at + 1);
+        // A raw LF/CR since the last hit disqualifies the span (stage 2's
+        // parse reports it). The scan is bounded by `at`, and consecutive
+        // ranges are disjoint, so the two scans stay linear together.
+        if clean && memchr2(b'\n', b'\r', &bytes[i..at]).is_some() {
+            clean = false;
         }
+        if bytes[at] == quote {
+            return Ok((at + 1, clean));
+        }
+        clean = false; // the backslash itself
         i = at + 2; // the backslash consumes the byte after it
     }
 }
@@ -312,13 +353,20 @@ mod tests {
 
     fn idx(input: &str) -> Vec<u32> {
         let mut v = Vec::new();
-        build_index(input.as_bytes(), &mut v).unwrap();
+        build_index(input.as_bytes(), &mut v, &mut Vec::new()).unwrap();
         v
+    }
+
+    fn spans(input: &str) -> Vec<Span> {
+        let mut v = Vec::new();
+        let mut s = Vec::new();
+        build_index(input.as_bytes(), &mut v, &mut s).unwrap();
+        s
     }
 
     fn err(input: &str) -> Error {
         let mut v = Vec::new();
-        build_index(input.as_bytes(), &mut v).unwrap_err()
+        build_index(input.as_bytes(), &mut v, &mut Vec::new()).unwrap_err()
     }
 
     #[test]
@@ -355,7 +403,7 @@ mod tests {
         assert_eq!(idx("/* multi\nline */[1]"), vec![16, 17, 18]);
         assert_eq!(idx("/**/[1,]"), vec![4, 5, 6, 7]);
         assert_eq!(idx("[1/*c*/,2]"), vec![0, 1, 7, 8, 9]);
-        assert!(build_index(b"/*/", &mut Vec::new()).is_err());
+        assert!(build_index(b"/*/", &mut Vec::new(), &mut Vec::new()).is_err());
     }
 
     #[test]
@@ -367,6 +415,30 @@ mod tests {
         // Structural bytes inside strings are not indexed.
         assert_eq!(idx(r#""{},:[]""#), vec![0]);
         assert_eq!(idx(r#"["a", 'b']"#), vec![0, 1, 4, 6, 9]);
+    }
+
+    /// Clean strings (no backslash, no raw LF/CR before the close) record a
+    /// span; escaped strings, strings with raw line terminators and strings
+    /// inside comments do not. Raw U+2028/U+2029 are content, not
+    /// terminators.
+    #[test]
+    fn clean_strings_record_spans() {
+        let sp = |o: u32, c: u32| Span { open: o, close: c };
+        assert_eq!(spans(r#""abc""#), vec![sp(0, 4)]);
+        assert_eq!(spans("''"), vec![sp(0, 1)]); // empty content is clean
+        assert_eq!(spans(r#"["a", 'b']"#), vec![sp(1, 3), sp(6, 8)]);
+        // Escapes disqualify, including line continuations.
+        assert_eq!(spans(r#""a\"b""#), Vec::<Span>::new());
+        assert_eq!(spans("\"a\\\nb\""), Vec::<Span>::new());
+        // Raw LF/CR disqualify (and the parse rejects them in stage 2).
+        assert_eq!(spans("\"a\nb\""), Vec::<Span>::new());
+        assert_eq!(spans("\"a\rb\""), Vec::<Span>::new());
+        // Raw LS/PS are legal content: still clean.
+        assert_eq!(spans("\"a\u{2028}b\""), vec![sp(0, 6)]);
+        // Strings inside comments are never indexed nor spanned.
+        assert_eq!(spans("// \"a\"\n1"), Vec::<Span>::new());
+        // Ascending by opening quote.
+        assert_eq!(spans("{'a': \"b\"}"), vec![sp(1, 3), sp(6, 8)]);
     }
 
     #[test]

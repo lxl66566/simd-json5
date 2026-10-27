@@ -12,7 +12,7 @@ use crate::{
     Error, Result,
     parser::{
         number,
-        stage1::{CLASSES, class, decode_seq, is_unicode_whitespace, token_end},
+        stage1::{CLASSES, Span, class, decode_seq, is_unicode_whitespace, token_end},
     },
     value::{MAX_DEPTH, Map, Str, Value},
 };
@@ -52,7 +52,8 @@ fn syntax(message: &str, offset: usize) -> Error {
     }
 }
 
-/// Build a DOM from the structural `index` over `bytes`.
+/// Build a DOM from the structural `index` and the clean-string `spans` of
+/// stage 1 over `bytes`.
 ///
 /// Containers deliberately grow from empty: pre-sizing them from the
 /// [`super::container_counts`] hints was tried in five variants (exact
@@ -64,11 +65,14 @@ fn syntax(message: &str, offset: usize) -> Error {
 /// DOM walk's hot loop is much tighter than the serde machinery; whatever
 /// the microarchitectural interaction is, pre-allocation from hints does
 /// not survive it, so this loop stays allocation-hint-free.
-pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32]) -> Result<Value<'a>> {
+pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32], spans: &[Span]) -> Result<Value<'a>> {
     let mut root: Option<Value<'a>> = None;
     // Typical documents nest shallower than this; one upfront allocation
     // covers the whole walk.
     let mut stack: Vec<Frame<'a>> = Vec::with_capacity(16);
+    // Clean-span cursor: spans are ordered by opening offset and every
+    // string open consumes at most the head.
+    let mut spans = spans;
 
     for &entry in index {
         // Stage-1 entries are always valid input positions (< bytes.len());
@@ -193,7 +197,7 @@ pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32]) -> Result<Value<'a>> {
                 },
             },
             b'"' | b'\'' => {
-                let (s, _) = parse_string(bytes, off)?;
+                let s = parse_string_spanned(bytes, off, &mut spans)?;
                 if let Some(Frame::Object {
                     state, pending_key, ..
                 }) = stack.last_mut()
@@ -389,6 +393,28 @@ pub(crate) fn parse_identifier(bytes: &[u8], off: usize, end: usize) -> Result<S
         Some(o) => Str::Dynamic(o),
         None => Str::Static(str_slice(bytes, off, end)),
     })
+}
+
+/// Parse the string whose opening quote is at `open`, borrowing directly
+/// when the stage-1 span cursor's head matches `open`: a clean span's
+/// content `bytes[open + 1..close]` is exactly what [`parse_string`] would
+/// return (no backslash means no escape processing and no line-continuation
+/// or terminator checks can fail), minus its re-scan of the content. The
+/// cursor only advances on a match: spans are ordered by opening offset, so
+/// the head belongs to some later string whenever it mismatches, and the
+/// full parse covers everything else.
+pub(crate) fn parse_string_spanned<'a>(
+    bytes: &'a [u8],
+    open: usize,
+    spans: &mut &[Span],
+) -> Result<Str<'a>> {
+    if let Some(Span { open: o, close }) = spans.first()
+        && *o as usize == open
+    {
+        *spans = &spans[1..];
+        return Ok(Str::Static(str_slice(bytes, open + 1, *close as usize)));
+    }
+    parse_string(bytes, open).map(|(s, _)| s)
 }
 
 /// Parse the string whose opening quote is at `open`. Returns the string and
