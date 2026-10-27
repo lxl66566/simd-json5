@@ -1,0 +1,36 @@
+[package]
+name = "simd-json5-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[dependencies.simd-json5]
+path = ".."
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "de_dom_parity"
+path = "fuzz_targets/de_dom_parity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "typed_shapes"
+path = "fuzz_targets/typed_shapes.rs"
+test = false
+doc = false
+bench = false
