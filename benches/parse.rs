@@ -107,15 +107,17 @@ fn bench_slice(c: &mut Criterion) {
 fn bench_typed(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse/typed");
     group.sample_size(100);
-    for (name, _) in CORPORA {
+    for (name, is_json) in CORPORA {
         let text = corpus(name);
         group.throughput(Throughput::Bytes(text.len() as u64));
 
-        group.bench_function(format!("{name}/serde_json"), |b| {
-            b.iter(|| {
-                black_box(serde_json::from_str::<serde_json::Value>(black_box(&text)).unwrap())
+        if is_json {
+            group.bench_function(format!("{name}/serde_json"), |b| {
+                b.iter(|| {
+                    black_box(serde_json::from_str::<serde_json::Value>(black_box(&text)).unwrap())
+                });
             });
-        });
+        }
 
         group.bench_function(format!("{name}/simd-json5"), |b| {
             b.iter(|| {

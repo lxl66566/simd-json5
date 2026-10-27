@@ -28,7 +28,10 @@ fn bench_serialize(c: &mut Criterion) {
     for (name, is_json) in CORPORA {
         let text = corpus(name);
         // The DOMs are prepared outside the measured routine; any JSON5
-        // parser can produce the shared serde_json::Value.
+        // parser can produce the shared serde_json::Value. Known distortion
+        // on the JSON5 corpora: serde_json::Value cannot hold non-finite
+        // floats, so their Infinity/NaN literals degrade to Null (a slightly
+        // shorter output than what simd-json5 serializes for its own DOM).
         let serde_value: serde_json::Value = serde_json5::from_str(&text).unwrap();
         let our_value = simd_json5::from_str(&text).unwrap();
 
@@ -64,9 +67,11 @@ fn bench_serialize(c: &mut Criterion) {
 fn bench_typed(c: &mut Criterion) {
     let mut group = c.benchmark_group("serialize/typed");
     group.sample_size(100);
-    for (name, _) in CORPORA {
+    for (name, is_json) in CORPORA {
         let text = corpus(name);
-        let serde_value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // Same DOM construction (and non-finite-to-Null distortion) as
+        // bench_serialize; serde_json itself only runs on strict JSON.
+        let serde_value: serde_json::Value = serde_json5::from_str(&text).unwrap();
         let our_value = simd_json5::from_str(&text).unwrap();
         group.throughput(Throughput::Bytes(text.len() as u64));
 
@@ -74,9 +79,11 @@ fn bench_typed(c: &mut Criterion) {
             b.iter(|| black_box(simd_json5::typed::to_vec(black_box(&our_value)).unwrap()));
         });
 
-        group.bench_function(format!("{name}/serde_json"), |b| {
-            b.iter(|| black_box(serde_json::to_vec(black_box(&serde_value))));
-        });
+        if is_json {
+            group.bench_function(format!("{name}/serde_json"), |b| {
+                b.iter(|| black_box(serde_json::to_vec(black_box(&serde_value))));
+            });
+        }
     }
     group.finish();
 }
