@@ -2,7 +2,10 @@
 
 #![cfg(feature = "serde")]
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
+};
 
 use serde::Deserialize;
 use simd_json5::{Error, Value, de, from_str, typed};
@@ -31,6 +34,79 @@ enum E {
     C(String),
     D(u8, u8),
     S { x: u8, y: u8 },
+}
+
+/// Float-keyed maps need a wrapper: f32/f64 are neither `Hash` nor `Ord`, so
+/// no standard collection key type reaches the float map-key branches. A
+/// manual `Deserialize` calling the float key methods directly is the way
+/// in (the same route a newtype wrapper over a float takes through
+/// `deserialize_newtype_struct`).
+#[derive(PartialEq, Debug)]
+struct F64Key(f64);
+
+impl Eq for F64Key {}
+
+impl Hash for F64Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+impl<'de> Deserialize<'de> for F64Key {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = F64Key;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a float map key")
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(F64Key(v))
+            }
+        }
+        deserializer.deserialize_f64(V)
+    }
+}
+
+/// The f32 flavor, exercising `deserialize_f32`'s forward to the f64 method.
+#[derive(PartialEq, Debug)]
+struct F32Key(f32);
+
+impl Eq for F32Key {}
+
+impl Hash for F32Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+impl<'de> Deserialize<'de> for F32Key {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = F32Key;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a float map key")
+            }
+
+            // The value arrives as f64 (`deserialize_f32` forwards there)
+            // and narrows back.
+            #[allow(clippy::cast_possible_truncation)]
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(F32Key(v as f32))
+            }
+        }
+        deserializer.deserialize_f32(V)
+    }
 }
 
 /// On pure JSON our typed walk must agree with serde_json value for value.
@@ -441,3 +517,185 @@ fn number_error_offsets_match_dom() {
         Error::InvalidNumber { offset: 1 }
     );
 }
+
+/// Bytes-expecting methods accept a JSON5 string, like serde_json's: its
+/// (unescaped) bytes reach the visitor through `visit_borrowed_bytes`/
+/// `visit_bytes`. Which types benefit is serde's choice, exactly as with
+/// serde_json: `&[u8]` and `CString` request the bytes methods, while
+/// `Vec<u8>`/`Box<[u8]>` deserialize as plain sequences and keep rejecting
+/// strings on both sides.
+#[test]
+fn bytes_accept_string_form() {
+    // Escape-free content borrows; either quote style.
+    let v: &[u8] = de::from_str(r#""abc""#).unwrap();
+    assert_eq!(v, b"abc");
+    let v: &[u8] = de::from_str("'xy'").unwrap();
+    assert_eq!(v, b"xy");
+    assert_eq!(serde_json::from_str::<&[u8]>(r#""abc""#).unwrap(), b"abc");
+    // Escaped content unescapes first and arrives as owned bytes, which
+    // serde's borrowed-slice visitor rejects — the serde_json outcome.
+    for doc in [r#""a\nb""#, r#""a\u0062c""#] {
+        let err = de::from_str::<&[u8]>(doc).unwrap_err();
+        assert!(
+            matches!(&err, Error::Syntax { message, .. } if message
+                .contains("invalid type: byte array, expected a borrowed byte array")),
+            "doc {doc}: {err:?}"
+        );
+        assert!(serde_json::from_str::<&[u8]>(doc).is_err(), "doc {doc}");
+    }
+    // `CString` is the standard type requesting `deserialize_byte_buf`.
+    let c: std::ffi::CString = de::from_str(r#""ab""#).unwrap();
+    assert_eq!(c.to_bytes(), b"ab");
+    assert_eq!(
+        serde_json::from_str::<std::ffi::CString>(r#""ab""#)
+            .unwrap()
+            .to_bytes(),
+        b"ab"
+    );
+    let err = de::from_str::<std::ffi::CString>(r#""a\u0000b""#).unwrap_err();
+    assert!(
+        matches!(&err, Error::Syntax { message, .. } if message.contains("nul byte")),
+        "{err:?}"
+    );
+    // Sequence targets keep rejecting strings, like serde_json.
+    for doc in [r#""abc""#, "'xy'"] {
+        let err = de::from_str::<Vec<u8>>(doc).unwrap_err();
+        assert!(
+            matches!(&err, Error::Syntax { message, .. } if message
+                .contains("invalid type: string \"")),
+            "doc {doc}: {err:?}"
+        );
+        assert!(serde_json::from_str::<Vec<u8>>(doc).is_err(), "doc {doc}");
+    }
+    // The array form still works.
+    assert_eq!(de::from_str::<Vec<u8>>("[1, 2, 3]").unwrap(), vec![1, 2, 3]);
+    // Other inputs stay serde type errors.
+    for doc in ["42", "true", "null", "1.5", "{}"] {
+        let err = de::from_str::<Vec<u8>>(doc).unwrap_err();
+        assert!(
+            matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type")),
+            "doc {doc}: {err:?}"
+        );
+    }
+}
+
+/// A map parsed from `doc` (always a literal, so the keys may borrow) must
+/// hold exactly one key equal to `expected`.
+fn assert_single_key<T>(doc: &'static str, expected: &T)
+where
+    T: Deserialize<'static> + Hash + Eq + PartialEq + std::fmt::Debug,
+{
+    let m: HashMap<T, u8> = de::from_str(doc).unwrap();
+    assert_eq!(m.len(), 1, "doc {doc}");
+    let key = m.into_keys().next().unwrap();
+    assert_eq!(&key, expected, "doc {doc}");
+}
+
+/// A map whose single key fails to parse as type `$ty` must produce an
+/// `invalid value` error naming `$expecting`.
+macro_rules! bad_key {
+    ($ty:ty, $expecting:expr, $doc:expr) => {{
+        let err = de::from_str::<HashMap<$ty, u8>>($doc).unwrap_err();
+        assert!(
+            matches!(&err, Error::Syntax { message, .. } if message.contains("invalid value")
+                && message.contains($expecting)),
+            "doc {}: {err:?}",
+            $doc
+        );
+    }};
+}
+
+/// The hand-written bool and numeric branches of the map-key deserializer:
+/// quoted key text is parsed by the target key type. Numbers use Rust's
+/// `FromStr` grammar — looser than serde_json's JSON-grammar numeric keys —
+/// and this test pins that behavior, including the divergences.
+#[test]
+fn map_key_bool_and_number_branches() {
+    // Bool keys: quoted or bare identifier, exactly `true`/`false`.
+    let m: HashMap<bool, u8> = de::from_str(r#"{ "true": 1, "false": 2 }"#).unwrap();
+    assert_eq!((m[&true], m[&false]), (1, 2));
+    let m: HashMap<bool, u8> = de::from_str("{ true: 1, false: 2 }").unwrap();
+    assert_eq!((m[&true], m[&false]), (1, 2));
+    // A failing bool key is an `invalid type` error like serde_json's.
+    // (serde_json's own message truncates the key text — it consumes the
+    // first byte before giving up — so only the error kind is comparable.)
+    let err = de::from_str::<HashMap<bool, u8>>(r#"{ "yes": 1 }"#).unwrap_err();
+    assert!(
+        matches!(&err, Error::Syntax { message, .. } if message
+            .contains("invalid type: string \"yes\", expected a boolean")),
+        "{err:?}"
+    );
+    let reference = serde_json::from_str::<HashMap<bool, u8>>(r#"{ "yes": 1 }"#).unwrap_err();
+    assert!(
+        reference.to_string().contains("invalid type: string")
+            && reference.to_string().contains("expected a boolean"),
+        "{reference}"
+    );
+
+    // Integer keys of every width, at each boundary.
+    assert_single_key::<i8>(r#"{ "127": 1 }"#, &127);
+    assert_single_key::<i8>(r#"{ "-128": 1 }"#, &-128);
+    assert_single_key::<i16>(r#"{ "-32768": 1 }"#, &-32768);
+    assert_single_key::<i32>(r#"{ "2147483647": 1 }"#, &i32::MAX);
+    assert_single_key::<i64>(r#"{ "-9223372036854775808": 1 }"#, &i64::MIN);
+    assert_single_key::<u8>(r#"{ "255": 1 }"#, &u8::MAX);
+    assert_single_key::<u16>(r#"{ "65535": 1 }"#, &u16::MAX);
+    assert_single_key::<u32>(r#"{ "4294967295": 1 }"#, &u32::MAX);
+    assert_single_key::<u64>(r#"{ "18446744073709551615": 1 }"#, &u64::MAX);
+    assert_single_key::<i128>(
+        r#"{ "170141183460469231731687303715884105727": 1 }"#,
+        &i128::MAX,
+    );
+    assert_single_key::<u128>(
+        r#"{ "340282366920938463463374607431768211455": 1 }"#,
+        &u128::MAX,
+    );
+    // Float keys through the wrapper types, including f64::MAX's decimal
+    // form and the f32 forward.
+    assert_single_key::<F64Key>(r#"{ "1.5e3": 1 }"#, &F64Key(1500.0));
+    assert_single_key::<F64Key>(r#"{ "1.7976931348623157e308": 1 }"#, &F64Key(f64::MAX));
+    assert_single_key::<F32Key>(r#"{ "2.5": 1 }"#, &F32Key(2.5));
+
+    // FromStr accepts a leading `+` for integers too, and the float
+    // spellings `Infinity`/`NaN`; serde_json's numeric keys reject all of
+    // these (their grammar is JSON's).
+    assert_single_key::<i64>(r#"{ "+1": 1 }"#, &1);
+    assert_single_key::<u64>(r#"{ "+1": 1 }"#, &1);
+    assert_single_key::<F64Key>(r#"{ "Infinity": 1 }"#, &F64Key(f64::INFINITY));
+    assert_single_key::<F64Key>(r#"{ "-Infinity": 1 }"#, &F64Key(f64::NEG_INFINITY));
+    let m: HashMap<F64Key, u8> = de::from_str(r#"{ "NaN": 1 }"#).unwrap();
+    assert!(m.into_keys().next().unwrap().0.is_nan());
+    assert!(serde_json::from_str::<HashMap<i64, u8>>(r#"{ "+1": 1 }"#).is_err());
+    assert!(serde_json::from_str::<HashMap<F64Key, u8>>(r#"{ "Infinity": 1 }"#).is_err());
+    assert!(serde_json::from_str::<HashMap<F64Key, u8>>(r#"{ "NaN": 1 }"#).is_err());
+
+    // Failures are `invalid value` errors naming the expected type.
+    bad_key!(i8, "expected i8", r#"{ "128": 1 }"#);
+    bad_key!(u8, "expected u8", r#"{ "-1": 1 }"#);
+    bad_key!(i64, "expected i64", r#"{ "x": 1 }"#);
+    bad_key!(i64, "expected i64", r#"{ "1.5": 1 }"#);
+    bad_key!(i64, "expected i64", r#"{ "Infinity": 1 }"#);
+    bad_key!(F64Key, "expected f64", r#"{ "0x10": 1 }"#);
+    bad_key!(F64Key, "expected f64", r#"{ "abc": 1 }"#);
+    bad_key!(
+        i128,
+        "expected i128",
+        r#"{ "340282366920938463463374607431768211456": 1 }"#
+    );
+}
+
+/// Borrowed `&str` map keys take the `visit_borrowed_str` path (escape-free
+/// keys); escaped keys own their text and cannot satisfy a `&str` key,
+/// exactly like escaped values for `&str` fields.
+#[test]
+fn borrowed_str_map_keys() {
+    let m: HashMap<&str, u8> = de::from_str(r#"{ "a": 1, 'b': 2 }"#).unwrap();
+    assert_eq!(m.get("a"), Some(&1));
+    assert_eq!(m.get("b"), Some(&2));
+    let err = de::from_str::<HashMap<&str, u8>>(r#"{ "a\nb": 1 }"#).unwrap_err();
+    assert!(
+        matches!(&err, Error::Syntax { message, .. } if message.contains("expected a borrowed string")),
+        "{err:?}"
+    );
+}
+

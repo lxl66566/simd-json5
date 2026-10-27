@@ -234,6 +234,26 @@ impl<'a, 'de> Deserializer<'a, 'de> {
         }
     }
 
+    /// Parse a value for a bytes-expecting method. Like serde_json, a string
+    /// is accepted: its (unescaped) bytes reach the visitor through
+    /// `visit_borrowed_bytes`/`visit_bytes`; anything else goes through the
+    /// seq path, so arrays of numbers still work and other inputs produce
+    /// serde's type errors.
+    fn parse_bytes<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
+        match self.peek_byte() {
+            Some(b'"' | b'\'') => {
+                let off = self.offset();
+                let (s, _) = stage2::parse_string(self.bytes, off)?;
+                self.bump();
+                match s {
+                    Str::Static(s) => visitor.visit_borrowed_bytes(s.as_bytes()),
+                    Str::Dynamic(s) => visitor.visit_bytes(s.as_bytes()),
+                }
+            },
+            _ => self.parse_seq(visitor),
+        }
+    }
+
     /// Parse a `[` container for a seq-expecting method (`seq`, `tuple`,
     /// `tuple_struct`, `bytes`); mismatches produce serde type errors.
     fn parse_seq<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
@@ -745,10 +765,14 @@ impl<'de> de::MapAccess<'de> for MapAccess<'_, '_, 'de> {
 }
 
 /// Offers an already-parsed key string to a field or map-key seed, borrowed
-/// when the source had no escapes. Like serde_json's `MapKeyDeserializer`,
-/// numeric and bool requests parse the key text, and enum requests treat it
-/// as the variant name; everything else forwards to `deserialize_any` so
-/// mismatched key types still produce standard serde type errors.
+/// when the source had no escapes. Bool and numeric requests parse the key
+/// text — numbers through Rust's `FromStr` grammar, which is looser than
+/// serde_json's JSON-grammar numeric keys (a leading `+` and the float
+/// spellings `Infinity`/`NaN` are accepted) — and enum requests treat it as
+/// the variant name; everything else forwards to `deserialize_any` so
+/// mismatched key types still produce standard serde type errors. The
+/// numeric and bool behavior is pinned by the map-key tests in
+/// `tests/typed_deserialize.rs`.
 struct MapKeyDeserializer<'de> {
     key: Str<'de>,
 }
@@ -761,7 +785,11 @@ impl<'de> MapKeyDeserializer<'de> {
         }
     }
 
-    /// Parse the key text as a number, for numeric map-key types.
+    /// Parse the key text as a number for numeric map-key types, through
+    /// Rust's `FromStr` grammar — deliberately looser than the document's
+    /// number grammar, since quoted keys carry arbitrary text and `FromStr`
+    /// accepts forms `parse_num` never sees (`+1`, `Infinity`). Pinned by
+    /// the map-key tests in `tests/typed_deserialize.rs`.
     fn parse_key_number<T: core::str::FromStr>(self, expecting: &'static str) -> Result<T> {
         let s = self.key.as_str();
         s.parse()
@@ -808,10 +836,8 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
         match self.key.as_str() {
             "true" => visitor.visit_bool(true),
             "false" => visitor.visit_bool(false),
-            other => Err(de::Error::invalid_value(
-                Unexpected::Str(other),
-                &"a boolean",
-            )),
+            // serde_json's key deserializer reports the same invalid_type.
+            other => Err(de::Error::invalid_type(Unexpected::Str(other), &visitor)),
         }
     }
 
@@ -1422,14 +1448,14 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_seq(visitor)
+        self.parse_bytes(visitor)
     }
 
     fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.parse_seq(visitor)
+        self.parse_bytes(visitor)
     }
 
     fn deserialize_option<V>(self, visitor: V) -> Result<V::Value>
