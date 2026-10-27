@@ -13,6 +13,21 @@ use crate::{
     value::Value,
 };
 
+/// Cap on the stage-1 index pre-allocation, in elements (256 MiB of `u32`).
+/// The `len / 8` estimate only has to spare the early reallocation chain on
+/// ordinary documents; inputs dense enough to outgrow it (or sparse enough
+/// to need a fraction) are served by normal vec growth, while an uncapped
+/// estimate would reserve 2 GiB for a 4 GiB input.
+const INITIAL_INDEX_MAX_ELEMS: usize = 64 << 20;
+
+/// Initial capacity for a stage-1 index over an input of `len` bytes: one
+/// entry per ~8 input bytes covers typical documents up front (twitter
+/// needs ~1/11, canada ~1/6), bounded by [`INITIAL_INDEX_MAX_ELEMS`].
+#[must_use]
+pub(crate) fn initial_index_capacity(len: usize) -> usize {
+    (len / 8).min(INITIAL_INDEX_MAX_ELEMS)
+}
+
 /// Build a DOM [`Value`] from a JSON5 document.
 ///
 /// # Contract
@@ -24,10 +39,7 @@ use crate::{
 /// invalid UTF-8 here is undefined behavior for string content, not an
 /// `Error::InvalidUtf8`. Debug builds assert the contract at every slice.
 pub(crate) fn parse(bytes: &[u8]) -> Result<Value<'_>> {
-    // One index entry per ~8 input bytes covers typical documents up front
-    // (twitter needs ~1/11, canada ~1/6); the early reallocation chain of
-    // the empty vec is what this avoids, dense inputs still grow.
-    let mut index = Vec::with_capacity(bytes.len() / 8);
+    let mut index = Vec::with_capacity(initial_index_capacity(bytes.len()));
     simd::build_index(bytes, &mut index)?;
     stage2::build(bytes, &index)
 }
@@ -110,9 +122,13 @@ pub(crate) fn container_counts(bytes: &[u8], index: &[u32]) -> Counts {
     counts.clear();
     counts.resize(index.len(), 0);
     // (index position of the `[` / `{`, commas seen at its nesting level).
-    let mut opens: Vec<(usize, u32)> = Vec::new();
+    // Typical documents nest far shallower than this; one upfront allocation
+    // covers the whole walk (stage 2 sizes its own stack the same way).
+    let mut opens: Vec<(usize, u32)> = Vec::with_capacity(16);
     for (at, &entry) in index.iter().enumerate() {
-        let off = usize::try_from(entry).expect("stage 1 offsets are input positions");
+        // Stage-1 entries are always valid input positions (< bytes.len());
+        // the widening cast is lossless (usize is at least 32 bits).
+        let off = entry as usize;
         // SAFETY: `off` comes from the stage 1 index built over this same
         // `bytes`: every entry is a valid input position (< bytes.len()),
         // the same contract `stage2::build` relies on for its own unchecked

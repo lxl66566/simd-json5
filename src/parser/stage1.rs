@@ -232,20 +232,26 @@ pub(crate) fn skip_comment(bytes: &[u8], slash: usize) -> Result<usize> {
     match bytes.get(slash + 1) {
         Some(b'/') => {
             // Line comment: runs to the newline (exclusive; the newline is
-            // ordinary whitespace for the next iteration).
-            let nl = memchr(b'\n', &bytes[slash + 2..]).unwrap_or(bytes.len() - (slash + 2));
-            Ok((slash + 2 + nl + 1).min(bytes.len()))
+            // ordinary whitespace for the next iteration), or to the end of
+            // input when there is none.
+            Ok(match memchr(b'\n', &bytes[slash + 2..]) {
+                Some(nl) => slash + 2 + nl + 1,
+                None => bytes.len(),
+            })
         },
         Some(b'*') => {
             // Block comments do not nest: the first `*/` ends them. The
-            // search starts after the opener so `/*/` stays unterminated.
+            // search starts after the opener's `*` so `/*/` stays
+            // unterminated; scanning for `*` instead of `/` also keeps
+            // slash-dense comments (`/* //// ... */`) from restarting the
+            // search on every hit.
             let mut i = slash + 2;
-            while let Some(hit) = memchr(b'/', &bytes[i..]) {
+            while let Some(hit) = memchr(b'*', &bytes[i..]) {
                 let at = i + hit;
-                // A `/` directly after the opener's `*` cannot close the
-                // comment (`/*/` stays open).
-                if at > slash + 2 && bytes[at - 1] == b'*' {
-                    return Ok(at + 1);
+                // A star as the last input byte has no successor and cannot
+                // close the comment.
+                if bytes.get(at + 1) == Some(&b'/') {
+                    return Ok(at + 2);
                 }
                 i = at + 1;
             }

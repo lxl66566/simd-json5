@@ -5,6 +5,11 @@
 //! or i64 (negative) stay integer variants; anything else becomes an exactly
 //! converted f64. Float evaluation is delegated to `fast_float2`; only sign
 //! handling, grammar validation and integer accumulation are done here.
+//!
+//! Hex integers wider than u128 (33 or more hex digits) accumulate in f64
+//! step by step (`f * 16.0 + digit`); the stepwise rounding may differ from
+//! a correctly rounded conversion by 1 ULP. Inputs that large are out of
+//! scope.
 
 use crate::{Error, Result, value::Value};
 

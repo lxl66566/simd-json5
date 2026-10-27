@@ -82,8 +82,7 @@ fn le_mask16<S: Simd>(simd: S, lane: u8x16<S>, bound: u8) -> u64 {
 #[inline(always)]
 fn eq_mask_native<S: Simd>(simd: S, bytes: &[u8], i: usize, byte: u8) -> u64 {
     let width = <S::u8s as SimdBase<S>>::LEN;
-    let all = [byte; 64];
-    let needle = <S::u8s as SimdBase<S>>::from_slice(simd, &all[..width]);
+    let needle = <S::u8s as SimdBase<S>>::splat(simd, byte);
     let mut acc = 0_u64;
     let mut k = 0;
     while k < 64 {
@@ -94,6 +93,27 @@ fn eq_mask_native<S: Simd>(simd: S, bytes: &[u8], i: usize, byte: u8) -> u64 {
         k += width;
     }
     acc
+}
+
+/// Pair of equality masks for `first` and `second` over the 64 bytes at
+/// `i`: every native block is loaded once and feeds both compares, half the
+/// loads of two [`eq_mask_native`] calls. Callers guarantee 64 readable
+/// bytes at `i`.
+#[inline(always)]
+fn pair_mask_native<S: Simd>(simd: S, bytes: &[u8], i: usize, first: u8, second: u8) -> (u64, u64) {
+    let width = <S::u8s as SimdBase<S>>::LEN;
+    let needle_first = <S::u8s as SimdBase<S>>::splat(simd, first);
+    let needle_second = <S::u8s as SimdBase<S>>::splat(simd, second);
+    let mut acc_first = 0_u64;
+    let mut acc_second = 0_u64;
+    let mut k = 0;
+    while k < 64 {
+        let v = <S::u8s as SimdBase<S>>::from_slice(simd, &bytes[i + k..i + k + width]);
+        acc_first |= v.simd_eq(needle_first).to_bitmask() << k;
+        acc_second |= v.simd_eq(needle_second).to_bitmask() << k;
+        k += width;
+    }
+    (acc_first, acc_second)
 }
 
 /// Load 64 bytes at `i` as four 128-bit lanes, unaligned like the scalar
@@ -379,8 +399,7 @@ fn skip_string_simd<S: Simd>(simd: S, bytes: &[u8], open: usize) -> Result<usize
     let mut i = open + 1;
     let mut ends_odd = false;
     while i + 64 <= len {
-        let bs = eq_mask_native(simd, bytes, i, b'\\');
-        let quotes = eq_mask_native(simd, bytes, i, quote);
+        let (bs, quotes) = pair_mask_native(simd, bytes, i, b'\\', quote);
         // A quote closes the string only when not escaped. With no
         // backslashes in the block the parity chain degenerates: the only
         // escape shadow is the carry-in on byte 0, and the carry always ends
@@ -442,8 +461,7 @@ fn skip_block_simd<S: Simd>(simd: S, bytes: &[u8], slash: usize) -> Result<usize
     // Set when byte `i - 1` is `*` (a `*/` may straddle a block boundary).
     let mut prev_star = false;
     while i + 64 <= len {
-        let stars = eq_mask_native(simd, bytes, i, b'*');
-        let slashes = eq_mask_native(simd, bytes, i, b'/');
+        let (stars, slashes) = pair_mask_native(simd, bytes, i, b'*', b'/');
         let mut closers = (stars << 1) & slashes;
         if prev_star && slashes & 1 != 0 {
             closers |= 1;
