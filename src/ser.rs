@@ -321,6 +321,12 @@ pub(crate) struct FormatterSink<'f, 'a> {
 
 impl Sink for FormatterSink<'_, '_> {
     fn push(&mut self, byte: u8) {
+        // After a failed `flush` the buffer stays full (`len == buf.len()`);
+        // writing on would index out of bounds. Drop the bytes instead:
+        // `finish` reports the failure once the walk completes.
+        if self.failed {
+            return;
+        }
         if self.len == self.buf.len() {
             self.flush();
         }
@@ -329,6 +335,11 @@ impl Sink for FormatterSink<'_, '_> {
     }
 
     fn extend(&mut self, mut bytes: &[u8]) {
+        // Same as `push`: once failed, `buf.len() - len == 0` would make
+        // every iteration copy zero bytes and loop forever.
+        if self.failed {
+            return;
+        }
         while !bytes.is_empty() {
             let take = core::cmp::min(bytes.len(), self.buf.len() - self.len);
             self.buf[self.len..self.len + take].copy_from_slice(&bytes[..take]);

@@ -1,6 +1,8 @@
 //! Exact-output tests for the serializer, plus a cross-check against
 //! `serde_json` on JSON-representable values.
 
+use std::fmt::Write as _;
+
 use simd_json5::{Map, Str, Value, to_string, to_string_pretty, to_vec};
 
 fn object(pairs: impl IntoIterator<Item = (&'static str, Value<'static>)>) -> Value<'static> {
@@ -127,6 +129,38 @@ fn display_streams_long_multibyte_output() {
     // Leading ASCII byte misaligns the chunks so boundaries fall mid-é.
     let value = Value::Str(Str::Dynamic(format!("x{}", "é".repeat(300))));
     assert_eq!(format!("{value}"), to_string(&value));
+}
+
+/// `fmt::Write` target that fails after `ok_calls` successful `write_str`
+/// calls, emulating a formatter with a budget or an underlying I/O error.
+struct FailingWrite {
+    ok_calls: usize,
+}
+
+impl std::fmt::Write for FailingWrite {
+    fn write_str(&mut self, _s: &str) -> std::fmt::Result {
+        if self.ok_calls == 0 {
+            return Err(std::fmt::Error);
+        }
+        self.ok_calls -= 1;
+        Ok(())
+    }
+}
+
+/// A formatter that fails mid-stream must surface `Err(fmt::Error)` from the
+/// `Display` impl instead of panicking (out-of-bounds `push`) or hanging
+/// (zero-progress `extend`) once the sink's buffer stays full. The document
+/// is far larger than the 256-byte streaming chunk, so the failing flush is
+/// hit early and every later write takes the failed path.
+#[test]
+fn display_survives_formatter_failure() {
+    let value = Value::Array(vec![Value::I64(1); 600]);
+    assert!(to_string(&value).len() > 256);
+    for ok_calls in 0..4 {
+        let mut target = FailingWrite { ok_calls };
+        let result = write!(target, "{value}");
+        assert_eq!(result, Err(std::fmt::Error), "ok_calls = {ok_calls}");
+    }
 }
 
 /// A DOM covering every `Value` variant, JSON-representable (finite floats).
