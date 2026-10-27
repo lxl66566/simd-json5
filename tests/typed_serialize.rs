@@ -218,3 +218,43 @@ fn differential_against_serde_json_on_values() {
         );
     }
 }
+
+/// `None` becomes `null` in both layouts; `char` and the 128-bit integer
+/// widths round out the scalar serializers against serde_json's output.
+#[test]
+fn none_char_and_128_bit_integers_match_serde_json() {
+    let none: Option<i32> = None;
+    assert_eq!(typed::to_string(&none).unwrap(), "null");
+    assert_eq!(typed::to_string_pretty(&none).unwrap(), "null");
+
+    for ch in ['A', 'z', '0', ' ', '"', '\u{e9}', '\u{1f600}', '\u{2028}'] {
+        assert_eq!(
+            typed::to_string(&ch).unwrap(),
+            serde_json::to_string(&ch).unwrap(),
+            "char {ch:?}"
+        );
+    }
+
+    for v in [i128::MIN, -1, 0, i128::MAX] {
+        assert_eq!(
+            typed::to_string(&v).unwrap(),
+            serde_json::to_string(&v).unwrap(),
+            "value {v}"
+        );
+    }
+    for v in [0, 1, u64::MAX.into(), u128::MAX] {
+        assert_eq!(
+            typed::to_string(&v).unwrap(),
+            serde_json::to_string(&v).unwrap(),
+            "value {v}"
+        );
+    }
+    assert_eq!(
+        typed::to_string_pretty(&i128::MIN).unwrap(),
+        serde_json::to_string_pretty(&i128::MIN).unwrap()
+    );
+    assert_eq!(
+        typed::to_string_pretty(&u128::MAX).unwrap(),
+        serde_json::to_string_pretty(&u128::MAX).unwrap()
+    );
+}

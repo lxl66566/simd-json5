@@ -36,8 +36,10 @@ where
     T: ?Sized + Serialize,
 {
     to_bytes(value, false).map(|bytes| {
-        // SAFETY: the writer only ever appends valid UTF-8 (see
-        // `ser::write_bytes`).
+        // SAFETY: the writer only ever appends ASCII or whole valid UTF-8
+        // sequences — string and char inputs are valid UTF-8 by type, the
+        // escapes it synthesizes are ASCII, and `serialize_bytes` rejects
+        // arbitrary bytes instead of writing them.
         unsafe { String::from_utf8_unchecked(bytes) }
     })
 }
@@ -49,8 +51,10 @@ where
     T: ?Sized + Serialize,
 {
     to_bytes(value, true).map(|bytes| {
-        // SAFETY: the writer only ever appends valid UTF-8 (see
-        // `ser::write_bytes`).
+        // SAFETY: the writer only ever appends ASCII or whole valid UTF-8
+        // sequences — string and char inputs are valid UTF-8 by type, the
+        // escapes it synthesizes are ASCII, and `serialize_bytes` rejects
+        // arbitrary bytes instead of writing them.
         unsafe { String::from_utf8_unchecked(bytes) }
     })
 }

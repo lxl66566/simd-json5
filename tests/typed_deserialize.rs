@@ -699,3 +699,42 @@ fn borrowed_str_map_keys() {
     );
 }
 
+/// `#[serde(flatten)]` buffers unknown members through `deserialize_any`
+/// and replays them through serde's flat-map adapter; both directions must
+/// work on top of our map access.
+#[test]
+fn flattened_struct_field() {
+    #[derive(Deserialize, PartialEq, Debug)]
+    struct Flat {
+        name: String,
+        #[serde(flatten)]
+        extra: BTreeMap<String, u32>,
+    }
+
+    // Container values inside the flattened tail exercise the buffered
+    // value forms (arrays, objects, null, strings, floats).
+    #[derive(Deserialize, PartialEq, Debug)]
+    struct Deep {
+        id: u8,
+        #[serde(flatten)]
+        rest: BTreeMap<String, serde_json::Value>,
+    }
+
+    let v: Flat = de::from_str(r"{ name: 'x', a: 1, b: 2, }").unwrap();
+    assert_eq!(v, Flat {
+        name: "x".into(),
+        extra: [("a".to_string(), 1), ("b".to_string(), 2)].into(),
+    });
+    let v: Deep = de::from_str(r"{ id: 7, tags: ['a'], nested: { k: null }, }").unwrap();
+    assert_eq!(v.id, 7);
+    assert_eq!(v.rest["tags"], serde_json::json!(["a"]));
+    assert_eq!(v.rest["nested"], serde_json::json!({ "k": null }));
+
+    // A known field still wins over the flattened tail, and a missing one
+    // is still an error.
+    let err = de::from_str::<Flat>(r#"{ "a": 1 }"#).unwrap_err();
+    assert!(
+        matches!(&err, Error::Syntax { message, .. } if message.contains("missing field `name`")),
+        "{err:?}"
+    );
+}

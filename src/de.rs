@@ -118,6 +118,9 @@ fn structural_error(b: u8, off: usize, ctx: Ctx) -> Error {
     }
 }
 
+/// Syntax-error constructor. Cold: keeps error construction out of the serde
+/// dispatch methods' code paths.
+#[cold]
 fn syntax(message: &str, offset: usize) -> Error {
     Error::Syntax {
         message: message.into(),
@@ -659,6 +662,9 @@ fn value_unexpected<'a>(v: &'a Value<'_>) -> Unexpected<'a> {
         Value::I64(i) => Unexpected::Signed(*i),
         Value::F64(f) => Unexpected::Float(*f),
         Value::Str(s) => Unexpected::Str(s.as_str()),
+        // Unreachable: every caller feeds this helper the output of
+        // `parse_scalar` or `parse_scalar_or_type_error`, which only produce
+        // scalars — their callers dispatch `[`/`{` containers themselves.
         Value::Array(_) => Unexpected::Seq,
         Value::Object(_) => Unexpected::Map,
     }
