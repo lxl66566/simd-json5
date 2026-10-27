@@ -209,22 +209,26 @@ pub(crate) fn skip_string_tail(
     mut escaped: bool,
 ) -> Result<usize> {
     let quote = bytes[open];
-    // `i` may overshoot the end by one on a dangling escape; the empty
-    // search range then reports the string as unterminated.
-    while let Some(hit) = memchr2(quote, b'\\', &bytes[i.min(bytes.len())..]) {
-        let at = i + hit;
+    loop {
         if escaped {
-            // The escaped byte is consumed whatever it is: it can neither
-            // close the string nor start a new escape.
+            // The pending backslash (the vector part's last byte) consumes
+            // exactly the byte at `i`, whatever it is. When that target is
+            // not itself a quote or backslash, the next hit below belongs to
+            // the string proper and must not be swallowed with it.
             escaped = false;
-            i = at + 1;
-        } else if bytes[at] == quote {
-            return Ok(at + 1);
-        } else {
-            i = at + 2; // the backslash consumes the byte after it
+            i += 1;
         }
+        // `i` may overshoot the end by one on a dangling escape; the empty
+        // search range then reports the string as unterminated.
+        let Some(hit) = memchr2(quote, b'\\', &bytes[i.min(bytes.len())..]) else {
+            return Err(Error::UnterminatedString { offset: open });
+        };
+        let at = i + hit;
+        if bytes[at] == quote {
+            return Ok(at + 1);
+        }
+        i = at + 2; // the backslash consumes the byte after it
     }
-    Err(Error::UnterminatedString { offset: open })
 }
 
 /// Position just past the comment whose `/` is at `slash`.

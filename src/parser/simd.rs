@@ -1096,6 +1096,28 @@ mod tests {
         differential(format!("\"{}\\\\\"{}\"y", "a".repeat(62), "b".repeat(62)).as_bytes());
     }
 
+    /// A vector string skip can end on a block boundary with a pending escape
+    /// whose target is not a quote or backslash: the scalar tail must consume
+    /// exactly that target byte, never the next quote/backslash hit (a former
+    /// bug swallowed the closing quote and reported the string unterminated).
+    #[test]
+    fn tail_escape_carry_consumes_exactly_one_target() {
+        // The backslash lands on the last byte of a 64-byte block for
+        // k = 63 + 64n; the sweep covers every alignment.
+        for k in 0..=140usize {
+            // Plain-letter target, close in the tail.
+            differential(format!("\"{}\\n{}\"", "a".repeat(k), "b".repeat(140 - k)).as_bytes());
+            // Target is the other quote kind, a backslash, or end of input.
+            differential(format!("\"{}\\'{}\"", "a".repeat(k), "b".repeat(140 - k)).as_bytes());
+            differential(format!("\"{}\\\\{}\"", "a".repeat(k), "b".repeat(140 - k)).as_bytes());
+            differential(format!("\"{}\\n", "a".repeat(k)).as_bytes());
+        }
+        // The originally failing shape: backslash at byte 64, target 'n'.
+        let s = format!("\"{}\\n\"", "a".repeat(63));
+        differential(s.as_bytes());
+        assert_eq!(idx(s.as_bytes()), vec![0]);
+    }
+
     /// Random bytes from a JSON5-ish alphabet: hits accept paths, every error
     /// variant, and every mask class.
     #[test]
