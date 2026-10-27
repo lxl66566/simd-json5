@@ -8,8 +8,6 @@
 //! already classified by stage 1, so only bytes at entry offsets plus string
 //! and token bodies are inspected here.
 
-use memchr::{memchr, memchr3};
-
 use crate::{
     Error, Result,
     parser::{
@@ -421,18 +419,61 @@ pub(crate) fn parse_string(bytes: &[u8], open: usize) -> Result<(Str<'_>, usize)
 }
 
 /// Offset of the first byte of interest to the string scanner at or after
-/// `from`: the closing `quote`, a backslash, or a raw line terminator. Two
-/// vectorized scans (`memchr3` for quote/backslash/LF, `memchr` for `\r`),
-/// taking the earlier hit.
+/// `from`: the closing `quote`, a backslash, or a raw line terminator.
+/// Single SWAR pass over little-endian words, 16 bytes (two u64) per
+/// iteration; on a hit the first half with a match is picked and located
+/// within by its first set high bit. Class-table tail for the final partial
+/// stretch. Measured faster than a memchr3+memchr pair on string-heavy
+/// corpora: the CR scan must stay bounded by the first quote/backslash/LF
+/// hit (an unbounded one made the parse quadratic), so the memchr form pays
+/// two passes and two call setups per string.
 fn find_interest(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
-    let hay = &bytes[from..];
-    let hit = match (memchr3(quote, b'\\', b'\n', hay), memchr(b'\r', hay)) {
-        (Some(a), Some(b)) => from + a.min(b),
-        (Some(a), None) => from + a,
-        (None, Some(b)) => from + b,
-        (None, None) => return None,
-    };
-    Some(hit)
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIBITS: u64 = 0x8080_8080_8080_8080;
+    const BS: u64 = 0x5c5c_5c5c_5c5c_5c5c;
+    const LF: u64 = 0x0a0a_0a0a_0a0a_0a0a;
+    const CR: u64 = 0x0d0d_0d0d_0d0d_0d0d;
+    /// Nonzero in the high bit of every byte that is zero in `x`.
+    const fn has_zero(x: u64) -> u64 {
+        x.wrapping_sub(ONES) & !x & HIBITS
+    }
+    /// Interest mask of one word: quote, backslash, LF or CR bytes.
+    const fn interest_mask(w: u64, q: u64) -> u64 {
+        has_zero(w ^ q) | has_zero(w ^ BS) | has_zero(w ^ LF) | has_zero(w ^ CR)
+    }
+    let q = ONES * u64::from(quote);
+    let mut i = from;
+    while i + 16 <= bytes.len() {
+        // from_le_bytes pins the word order, so trailing_zeros/8 is the first
+        // matching byte regardless of the host endianness.
+        let m0 = interest_mask(u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap()), q);
+        let m1 = interest_mask(
+            u64::from_le_bytes(bytes[i + 8..i + 16].try_into().unwrap()),
+            q,
+        );
+        if (m0 | m1) != 0 {
+            // First half with a hit, then the first matching byte in it.
+            let (m, k) = if m0 != 0 {
+                (m0, 0)
+            } else {
+                (m1, 8)
+            };
+            return Some(i + k + (m.trailing_zeros() / 8) as usize);
+        }
+        i += 16;
+    }
+    let interest = class::BACKSLASH
+        | class::LF
+        | class::CR
+        | if quote == b'"' {
+            class::DQUOTE
+        } else {
+            class::SQUOTE
+        };
+    bytes[i..]
+        .iter()
+        .position(|&b| CLASSES[b as usize] & interest != 0)
+        .map(|k| i + k)
 }
 
 /// Handle the escape whose backslash is at `esc`; returns the position just
