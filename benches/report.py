@@ -10,11 +10,21 @@ Reads target/criterion/**/new/estimates.json written by
 entries from benches/results/one_shot.jsonl, and writes a dated JSON record
 plus parse.svg / serialize.svg throughput charts for the README.
 
-Usage: uv run benches/report.py
+Throughput uses the median (robust against tail noise, matching ab.py); the
+mean is kept in the record for reference.
+
+Usage: uv run benches/report.py [--run] [--full]
+       [--sample-size N] [--warm-up-time S] [--measurement-time S]
+
+--run executes the benches first with a quick configuration (50 samples,
+1 s warmup, 3 s measurement) filtered to the README comparison groups,
+skipping the slice/typed diagnostic groups (~3 min instead of ~10).
+--full measures every group at criterion defaults.
 """
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import math
@@ -72,10 +82,25 @@ def collect_criterion() -> list[dict]:
             "corpus": corpus,
             "impl": impl,
             "mean_ns": estimates["mean"]["point_estimate"],
+            "median_ns": estimates["median"]["point_estimate"],
             "std_dev_ns": estimates["std_dev"]["point_estimate"],
             "samples": len(times),
         })
     return out
+
+
+def run_benches(args: argparse.Namespace) -> None:
+    cmd = [
+        "cargo", "bench", "--bench", "parse", "--bench", "serialize", "--",
+        "--sample-size", str(args.sample_size),
+        "--warm-up-time", str(args.warm_up_time),
+        "--measurement-time", str(args.measurement_time),
+    ]
+    if not args.full:
+        corpora = "|".join(c.replace(".", r"\.") for c in CORPORA)
+        cmd.append(f"^(parse|serialize)/({corpora})/")
+    print("$ " + " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=REPO, check=True)
 
 
 def collect_one_shot() -> list[dict]:
@@ -202,6 +227,25 @@ def summarize(record: dict) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--run", action="store_true", help="run the benches before collecting")
+    parser.add_argument(
+        "--full", action="store_true",
+        help="with --run: every group at criterion defaults instead of the quick "
+        "comparison-group configuration",
+    )
+    parser.add_argument("--sample-size", type=int, default=50)
+    parser.add_argument("--warm-up-time", type=float, default=1.0)
+    parser.add_argument("--measurement-time", type=float, default=3.0)
+    args = parser.parse_args()
+
+    if args.full:
+        args.sample_size, args.warm_up_time, args.measurement_time = 100, 3.0, 5.0
+    if args.run:
+        run_benches(args)
+
     if not CRITERION.is_dir():
         sys.exit("target/criterion not found; run `cargo bench --bench parse --bench serialize` first")
     results = collect_criterion() + collect_one_shot()
@@ -211,7 +255,7 @@ def main() -> None:
     sizes = {p.name: p.stat().st_size for p in DATA.iterdir() if p.suffix in (".json", ".json5")}
     record = environment() | {"corpus_bytes": sizes, "results": results}
     for r in results:
-        r["mb_s"] = sizes[r["corpus"]] * 1e3 / r["mean_ns"]
+        r["mb_s"] = sizes[r["corpus"]] * 1e3 / r.get("median_ns", r["mean_ns"])
     order = {
         (bench, corpus): i
         for i, (bench, corpus) in enumerate(

@@ -6,29 +6,29 @@ Fastest JSON5 parser and serializer for Rust, with optional serde support.
 
 DOM parse and serialization throughput against the other Rust JSON5 implementations (`json5`, `serde-json5`) and the JSON implementations `serde_json`, `simd-json`, `sonic-rs`.
 
-simd-json5 is the fastest JSON5 implementation on every corpus: in criterion runs it parses 2.6-85x faster than `json5` and 6.5-39x faster than `serde-json5` (`canada.json` 7,000x faster than `json5` crate). Against JSON implementations it parses 1.0-1.5x faster than `serde_json` and serializes on par; the SIMD specialists `simd-json` and `sonic-rs` stay ahead on strict-JSON input (up to ~6x).
+simd-json5 is the fastest JSON5 implementation on every corpus: in criterion runs it parses 2.4-83x faster than `json5` and 8.4-40x faster than `serde-json5` (`canada.json` 9,300x faster than `json5` crate). Against JSON implementations it parses up to 1.5x faster than `serde_json` (on par on the float-heavy `canada.json`) and serializes within 25% of it; the SIMD specialists `simd-json` and `sonic-rs` stay ahead on strict-JSON input (up to ~4.6x).
 
 Parse throughput, decimal MB/s, higher is better:
 
 | Corpus            | simd-json5 |  json5 | serde-json5 | serde_json | simd-json | sonic-rs |
 | ----------------- | ---------: | -----: | ----------: | ---------: | --------: | -------: |
-| twitter.json      |    **642** |    196 |          16 |        437 |       625 |     2105 |
-| citm_catalog.json |    **839** |    326 |          33 |        585 |       699 |     2354 |
-| canada.json       |    **253** | 0.03\* |          39 |        243 |       313 |     1493 |
-| json5.json5       |    **277** |    3.3 |          30 |          - |         - |        - |
+| twitter.json      |    **655** |    200 |          16 |        439 |       602 |     2128 |
+| citm_catalog.json |    **787** |    323 |          32 |        580 |      1317 |     2389 |
+| canada.json       |    **324** | 0.03\* |          39 |        349 |       616 |     1491 |
+| json5.json5       |    **272** |    3.3 |          30 |          - |         - |        - |
 
 Serialization throughput, decimal MB/s, higher is better:
 
 | Corpus            | simd-json5 | json5 | serde-json5 | serde_json |
 | ----------------- | ---------: | ----: | ----------: | ---------: |
-| twitter.json      |       2702 |   234 |         229 |   **2835** |
-| citm_catalog.json |       4300 |   432 |         760 |   **5010** |
-| canada.json       |   **1094** |   111 |         319 |       1087 |
-| json5.json5       |   **1721** |   278 |         368 |          - |
+| twitter.json      |       2675 |   228 |         234 |   **2827** |
+| citm_catalog.json |       4011 |   431 |         761 |   **5164** |
+| canada.json       |       1048 |   114 |         318 |   **1112** |
+| json5.json5       |   **1694** |   276 |         371 |          - |
 
 (`*`: `json5` behaves quadratically on long float arrays, making repeated measurement of `canada.json` impractical.)
 
-Reproduce with `cargo bench --bench parse --bench serialize`.
+Reproduce with `uv run benches/report.py --run` (README comparison groups only, ~3 min); `cargo bench --bench parse --bench serialize` runs the full criterion suites.
 
 ## Usage
 

@@ -1,4 +1,4 @@
-//! Number parsing for the DESIGN grammar pin `[+-]?(Infinity|NaN|Hex|Decimal)`.
+//! Number parsing for the `[+-]?(Infinity|NaN|Hex|Decimal)`.
 //!
 //! Decimal forms follow ECMAScript 5.1: `5.`, `.5`, `1.e3`, `+1` and `007`
 //! are valid; `.e3`, `1e` and `0x` are not. Integers that fit u64 (positive)

@@ -2,7 +2,7 @@
 //!
 //! Walks the index with an explicit container stack (no recursion), enforces
 //! JSON5 grammar and container shape, and builds a [`Value`] borrowing from
-//! the input bytes. See `DESIGN.md` for the grammar pin.
+//! the input bytes.
 //!
 //! Everything between index entries is separators (whitespace or comments),
 //! already classified by stage 1, so only bytes at entry offsets plus string

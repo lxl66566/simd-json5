@@ -1,4 +1,4 @@
-//! Accept/reject compliance table for the JSON5 grammar pin in `DESIGN.md`.
+//! Accept/reject compliance table for the JSON5 grammar.
 
 use simd_json5::{Error, Str, Value};
 
