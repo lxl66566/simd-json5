@@ -267,3 +267,32 @@ fn compact_matches_serde_json() {
     let expected = serde_json::to_string(&to_serde(&value)).unwrap();
     assert_eq!(String::from_utf8(to_vec(&value)).unwrap(), expected);
 }
+
+/// Pretty indentation is served from a static space cache. Depths past a
+/// 64-level cache boundary (and the parser's full depth cap) must still
+/// produce the exact two-spaces-per-level layout, byte for byte.
+#[test]
+fn pretty_indent_deep_nesting() {
+    fn expected(depth: usize) -> String {
+        let mut out = String::from("[");
+        for level in 1..depth {
+            out.push('\n');
+            out.push_str(&" ".repeat(2 * level));
+            out.push('[');
+        }
+        out.push('\n');
+        out.push_str(&" ".repeat(2 * depth));
+        out.push('1');
+        for level in (0..depth).rev() {
+            out.push('\n');
+            out.push_str(&" ".repeat(2 * level));
+            out.push(']');
+        }
+        out
+    }
+    for depth in [65, 70, simd_json5::MAX_DEPTH] {
+        let text = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let value = simd_json5::from_str(&text).unwrap();
+        assert_eq!(to_string_pretty(&value), expected(depth), "depth = {depth}");
+    }
+}

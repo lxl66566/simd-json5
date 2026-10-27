@@ -9,7 +9,7 @@
 //! compatible with `serde_json::to_string_pretty` on JSON-representable
 //! values.
 
-use crate::value::{Map, Value};
+use crate::value::{MAX_DEPTH, Map, Value};
 
 /// Per-byte escape classification for string contents.
 ///
@@ -26,9 +26,10 @@ const SHORT_ESCAPES: [u8; 8] = *b"\x00\"\\btnfr";
 /// Class of an arbitrary C0 control byte that has no short escape.
 const CLASS_UNICODE: u8 = 8;
 
-/// Indent run for pretty mode: covers the first 64 levels (128 bytes); deeper
-/// indentation falls back to writing the remainder byte by byte.
-const SPACE_CACHE: [u8; 128] = [b' '; 128];
+/// Indent run for pretty mode: two spaces per level, covering every nesting
+/// depth the parser accepts ([`MAX_DEPTH`]); deeper hand-built indentation
+/// falls back to writing the remainder byte by byte.
+const SPACE_CACHE: [u8; 2 * MAX_DEPTH] = [b' '; 2 * MAX_DEPTH];
 
 const fn build_escape_table() -> [u8; 256] {
     let mut table = [0; 256];
