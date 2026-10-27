@@ -66,6 +66,7 @@ Parsing runs in two stages — a SIMD scan indexes structural characters (commen
 
 - Map keys must be strings (or string-like: `char`, unit variant names). Integer, bool or float keys are rejected with an error instead of being rendered as quoted strings the way `serde_json` does.
 - Non-finite floats serialize as the JSON5 literals `NaN` / `Infinity` / `-Infinity`; all other output is strict JSON.
+- Float formatting follows `serde_json` >= 1.0.154 (both use the `zmij` backend): exponents carry an explicit sign, e.g. `1e+300`. Older `serde_json` (ryu backend) prints `1e300` instead.
 
 ## Feature flags
 

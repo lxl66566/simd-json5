@@ -1,3 +1,8 @@
+# Several options below are nightly rustfmt only (unstable_features and
+# everything it gates, e.g. imports_granularity, group_imports,
+# format_strings, comment_width). A stable toolchain silently skips them and
+# produces different formatting, so run `cargo +nightly fmt`.
+
 blank_lines_lower_bound       = 0
 blank_lines_upper_bound       = 1
 brace_style                   = "SameLineWhere"
