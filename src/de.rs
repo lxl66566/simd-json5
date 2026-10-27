@@ -30,10 +30,10 @@ use serde::de::{self, DeserializeSeed, Unexpected, Visitor};
 use crate::{
     Error, Result,
     parser::{
-        container_counts,
+        container_counts, initial_index_capacity,
         number::{self, Num},
         simd,
-        stage1::token_end,
+        stage1::{CLASSES, class, token_end},
         stage2,
     },
     value::{MAX_DEPTH, Map, Str, Value},
@@ -45,9 +45,7 @@ pub fn from_str<'de, T>(s: &'de str) -> Result<T>
 where
     T: serde::Deserialize<'de>,
 {
-    // One index entry per ~8 input bytes up front, like `parser::parse`;
-    // growing from an empty vec pays the reallocation chain this avoids.
-    let mut index = Vec::with_capacity(s.len() / 8);
+    let mut index = Vec::with_capacity(initial_index_capacity(s.len()));
     simd::build_index(s.as_bytes(), &mut index)?;
     let counts = container_counts(s.as_bytes(), &index);
     let mut de = Deserializer::new(s.as_bytes(), &index, counts.as_slice());
@@ -161,7 +159,9 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Entry offset the cursor stands on, or end of input for EOF errors.
     fn offset(&self) -> usize {
         match self.index.get(self.pos) {
-            Some(&e) => usize::try_from(e).expect("stage 1 offsets are input positions"),
+            // Entries are input offsets and stage 1 caps input length at
+            // u32::MAX, so the cast never truncates.
+            Some(&e) => e as usize,
             None => self.bytes.len(),
         }
     }
@@ -171,7 +171,7 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     fn peek_entry(&self) -> Option<(u8, usize)> {
         match self.index.get(self.pos) {
             Some(&e) => {
-                let off = usize::try_from(e).expect("stage 1 offsets are input positions");
+                let off = e as usize;
                 Some((self.bytes[off], off))
             },
             None => None,
@@ -191,9 +191,7 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Reject trailing input after a complete root value.
     fn end(&mut self) -> Result<()> {
         match self.index.get(self.pos) {
-            Some(&e) => Err(Error::TrailingCharacters {
-                offset: usize::try_from(e).expect("stage 1 offsets are input positions"),
-            }),
+            Some(&e) => Err(Error::TrailingCharacters { offset: e as usize }),
             None => Ok(()),
         }
     }
@@ -289,13 +287,23 @@ impl<'a, 'de> Deserializer<'a, 'de> {
         }
     }
 
-    /// True when the cursor stands on the bare token `null`.
+    /// True when the cursor stands on the bare token `null`. Constant time:
+    /// match the four literal bytes, then require a token terminator.
+    /// `nullx`-style longer tokens compare unequal and reach the scalar
+    /// path, which reports stage 2's unknown literal. Only `token_end`
+    /// classifies a high-bit terminator (Unicode whitespace ends a token,
+    /// other non-ASCII continues it), so that rare boundary keeps the scan.
     fn peek_is_null(&self) -> bool {
-        if self.peek_byte() == Some(b'n') {
-            let off = self.offset();
-            &self.bytes[off..token_end(self.bytes, off)] == b"null"
-        } else {
-            false
+        let Some((b'n', off)) = self.peek_entry() else {
+            return false;
+        };
+        if self.bytes.get(off..off + 4) != Some(b"null") {
+            return false;
+        }
+        match self.bytes.get(off + 4) {
+            None => true,
+            Some(&b) if b >= 0x80 => &self.bytes[off..token_end(self.bytes, off)] == b"null",
+            Some(&b) => CLASSES[b as usize] & class::TOKEN == 0,
         }
     }
 
@@ -1859,6 +1867,46 @@ mod tests {
             from_str::<E>(r#"{"B":1,,}"#).unwrap_err(),
             Error::TrailingCharacters { offset: 6 }
         );
+    }
+
+    /// `peek_is_null`'s O(1) check must agree with the token scan for every
+    /// terminator class: token bytes extend the literal into an unknown
+    /// literal, ASCII separators and whitespace end it, and high-bit bytes
+    /// need the Unicode-whitespace classification (NBSP ends the token,
+    /// other non-ASCII continues it).
+    #[test]
+    fn option_null_boundary_tokens() {
+        for doc in [
+            "nullx",
+            "null1",
+            "null+",
+            "null_",
+            "null$",
+            "null.",
+            "nullé",
+            r"null\x41",
+            "null\u{a0}x",
+        ] {
+            assert_eq!(
+                from_str::<Option<u8>>(doc).unwrap_err(),
+                crate::from_str(doc).unwrap_err(),
+                "doc {doc:?}"
+            );
+        }
+        for doc in [
+            "null",
+            "null ",
+            "null\t",
+            "null// c",
+            "null/* c */",
+            "null\u{a0}",
+        ] {
+            assert_eq!(from_str::<Option<u8>>(doc).unwrap(), None, "doc {doc:?}");
+        }
+        // Boundary classes inside containers, where the next entry follows.
+        assert_eq!(from_str::<Vec<Option<u8>>>("[null,null]").unwrap(), vec![
+            None, None
+        ]);
     }
 
     #[test]
