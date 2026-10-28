@@ -21,7 +21,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Result, ser::serde_impls::to_bytes};
+use crate::{
+    Result,
+    ser::{bytes_to_string, serde_impls::to_bytes},
+};
 
 /// Serialize any serializable value to compact JSON5 text.
 ///
@@ -35,13 +38,7 @@ pub fn to_string<T>(value: &T) -> Result<String>
 where
     T: ?Sized + Serialize,
 {
-    to_bytes(value, false).map(|bytes| {
-        // SAFETY: the writer only ever appends ASCII or whole valid UTF-8
-        // sequences — string and char inputs are valid UTF-8 by type, the
-        // escapes it synthesizes are ASCII, and `serialize_bytes` rejects
-        // arbitrary bytes instead of writing them.
-        unsafe { String::from_utf8_unchecked(bytes) }
-    })
+    to_bytes(value, false).map(bytes_to_string)
 }
 
 /// Serialize any serializable value to pretty-printed JSON5 text (two-space
@@ -50,13 +47,7 @@ pub fn to_string_pretty<T>(value: &T) -> Result<String>
 where
     T: ?Sized + Serialize,
 {
-    to_bytes(value, true).map(|bytes| {
-        // SAFETY: the writer only ever appends ASCII or whole valid UTF-8
-        // sequences — string and char inputs are valid UTF-8 by type, the
-        // escapes it synthesizes are ASCII, and `serialize_bytes` rejects
-        // arbitrary bytes instead of writing them.
-        unsafe { String::from_utf8_unchecked(bytes) }
-    })
+    to_bytes(value, true).map(bytes_to_string)
 }
 
 /// Serialize any serializable value to compact JSON5 bytes.
@@ -65,6 +56,15 @@ where
     T: ?Sized + Serialize,
 {
     to_bytes(value, false)
+}
+
+/// Serialize any serializable value to pretty-printed JSON5 bytes (the
+/// byte form of [`to_string_pretty`]).
+pub fn to_vec_pretty<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: ?Sized + Serialize,
+{
+    to_bytes(value, true)
 }
 
 /// Deserialize `T` from a JSON5 document; delegates to [`crate::de`].

@@ -353,6 +353,12 @@ impl<'a> From<&'a str> for Value<'a> {
     }
 }
 
+impl From<String> for Value<'_> {
+    fn from(s: String) -> Self {
+        Self::Str(Str::Dynamic(s))
+    }
+}
+
 impl<'a> From<Vec<Value<'a>>> for Value<'a> {
     fn from(v: Vec<Value<'a>>) -> Self {
         Self::Array(v)

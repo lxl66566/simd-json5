@@ -658,6 +658,17 @@ fn write_bytes(value: &Value<'_>, pretty: bool) -> Vec<u8> {
     writer.out
 }
 
+/// Turn serialization output into a `String`: the shared tail of the text
+/// entry points here and in the typed facade.
+pub(crate) fn bytes_to_string(bytes: Vec<u8>) -> String {
+    // SAFETY: the writer's output is valid UTF-8 by construction on both the
+    // DOM and the typed path (see `write_bytes`): passthrough copies whole
+    // bytes of input strings and chars (valid UTF-8 by type, and no escape
+    // can split a multi-byte sequence), every synthesized escape is ASCII,
+    // and `serialize_bytes` rejects arbitrary bytes instead of writing them.
+    unsafe { String::from_utf8_unchecked(bytes) }
+}
+
 /// Serialize to compact JSON5 text.
 ///
 /// ```
@@ -670,8 +681,7 @@ fn write_bytes(value: &Value<'_>, pretty: bool) -> Vec<u8> {
 /// ```
 #[must_use]
 pub fn to_string(value: &Value<'_>) -> String {
-    // SAFETY: see `write_bytes`; only valid UTF-8 bytes are ever written.
-    unsafe { String::from_utf8_unchecked(write_bytes(value, false)) }
+    bytes_to_string(write_bytes(value, false))
 }
 
 /// Serialize to pretty-printed JSON5 text: two-space indentation, `": "` after
@@ -686,8 +696,7 @@ pub fn to_string(value: &Value<'_>) -> String {
 /// ```
 #[must_use]
 pub fn to_string_pretty(value: &Value<'_>) -> String {
-    // SAFETY: see `write_bytes`; only valid UTF-8 bytes are ever written.
-    unsafe { String::from_utf8_unchecked(write_bytes(value, true)) }
+    bytes_to_string(write_bytes(value, true))
 }
 
 /// Serialize to compact JSON5 bytes.
