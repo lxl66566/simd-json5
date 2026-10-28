@@ -4,3 +4,7 @@ coverage
 corpus/**
 !corpus/*/
 !corpus/*/seed*
+
+.runs
+logs
+journal.tsv

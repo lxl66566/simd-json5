@@ -2,10 +2,9 @@
 
 //! Public parse/serialize invariants over arbitrary bytes:
 //!
-//! - `from_slice` either errors (including invalid UTF-8) or yields a DOM;
-//!   it must never panic.
-//! - Serializing a parsed DOM (compact and pretty) must reparse to an equal
-//!   DOM (NaN-tolerant equality).
+//! - `from_slice` either errors (including invalid UTF-8) or yields a DOM; it must never panic.
+//! - Serializing a parsed DOM (compact and pretty) must reparse to an equal DOM (NaN-tolerant
+//!   equality).
 //! - The `Display` impl must render the same bytes as [`simd_json5::to_string`].
 
 use libfuzzer_sys::fuzz_target;

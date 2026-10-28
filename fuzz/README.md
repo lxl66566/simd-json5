@@ -2,6 +2,15 @@
 
 Run a target: `cargo fuzz run <target> -- -dict=fuzz/dict/json5.dict -timeout=5 <max_total_time=N>`.
 
+Long campaigns use `fuzz/run-fuzz.sh` instead: it runs a target with parallel workers for a wall-clock budget and journals progress, so the campaign survives stops and restarts — to fix a crash, for example — without exceeding the total budget.
+
+```sh
+fuzz/run-fuzz.sh parse 6 18000 &   # target, workers, budget seconds
+fuzz/status.sh                     # per-target workers/execs/cov/budget/artifacts
+```
+
+Stop a generation with `kill -TERM <run-fuzz.sh pid>` (elapsed time is still journaled); rerun the script to spend the remaining budget. Crash, timeout and OOM artifacts land in `fuzz/artifacts/<target>/`. `fuzz/journal.tsv`, `fuzz/logs/` and `fuzz/.runs/` are campaign state, not seeds.
+
 Targets:
 
 - `parse`: `from_slice` must never panic; compact and pretty serialization of a parsed DOM must reparse to an equal DOM (NaN-tolerant), and `Display` must render the same bytes as `to_string`.

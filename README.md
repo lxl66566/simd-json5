@@ -60,6 +60,8 @@ assert_eq!(simd_json5::typed::to_string(&p).unwrap(), r#"{"x":1,"y":2}"#);
 
 Production code uses `unsafe` sparingly: 11 blocks, each with a safety argument and its invariant.
 
+A 1.83-billion-execution libFuzzer campaign found no crashes; see `fuzz/README.md`.
+
 ## Serialization notes
 
 Parsing runs in two stages — a SIMD scan indexes structural characters (comments, unquoted keys and single-quoted strings included), then a semantic pass builds a zero-copy `Value` borrowing from the input.

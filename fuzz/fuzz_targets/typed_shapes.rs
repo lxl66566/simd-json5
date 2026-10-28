@@ -11,11 +11,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use serde::Deserialize;
-
-const MAX_DEPTH_PROBE: usize = 200;
+use simd_json5_fuzz::depth;
 
 fuzz_target!(|data: &[u8]| {
-    if depth_estimate(data) > MAX_DEPTH_PROBE {
+    if depth::estimate(data) > depth::MAX_PROBE {
         return;
     }
     let _ = simd_json5::de::from_slice::<OnlyA>(data);
@@ -37,20 +36,4 @@ enum E {
     A,
     B(u8),
     C { x: u8 },
-}
-
-fn depth_estimate(data: &[u8]) -> usize {
-    let mut depth = 0usize;
-    let mut max = 0usize;
-    for &b in data {
-        match b {
-            b'[' | b'{' => {
-                depth += 1;
-                max = max.max(depth);
-            },
-            b']' | b'}' => depth = depth.saturating_sub(1),
-            _ => {},
-        }
-    }
-    max
 }

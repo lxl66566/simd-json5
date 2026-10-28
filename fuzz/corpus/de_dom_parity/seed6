@@ -1,0 +1,1 @@
+[0x1f, 0X0, .5, 5., +.5, -0x1f, 007, 1e3, 1E+3, 1e-3, Infinity, -Infinity, NaN, +0]
