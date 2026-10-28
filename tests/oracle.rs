@@ -30,11 +30,38 @@ fn conv(v: &serde_json::Value) -> Value<'static> {
     }
 }
 
+/// Number-variant tags of every number in the tree, in document order.
+/// `Value::PartialEq` treats numerically equal `I64`/`U64` as equal, so the
+/// oracle must compare the classification itself as well.
+fn number_variants(v: &Value<'_>, out: &mut Vec<u8>) {
+    match v {
+        Value::I64(_) => out.push(0),
+        Value::U64(_) => out.push(1),
+        Value::F64(_) => out.push(2),
+        Value::Array(items) => {
+            for v in items {
+                number_variants(v, out);
+            }
+        },
+        Value::Object(members) => {
+            for (_, v) in members {
+                number_variants(v, out);
+            }
+        },
+        _ => {},
+    }
+}
+
 fn check(json: &str) {
     let theirs: serde_json::Value =
         serde_json::from_str(json).unwrap_or_else(|e| panic!("serde_json rejected: {e}"));
     let ours = simd_json5::from_str(json).unwrap_or_else(|e| panic!("we rejected: {e}"));
-    assert_eq!(ours, conv(&theirs), "document: {json}");
+    let expected = conv(&theirs);
+    assert_eq!(ours, expected, "document: {json}");
+    let (mut ours_tags, mut expected_tags) = (Vec::new(), Vec::new());
+    number_variants(&ours, &mut ours_tags);
+    number_variants(&expected, &mut expected_tags);
+    assert_eq!(ours_tags, expected_tags, "number variants: {json}");
 }
 
 #[test]
