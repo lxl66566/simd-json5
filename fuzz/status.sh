@@ -6,7 +6,7 @@
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 budget=${FUZZ_BUDGET:-18000}
-targets=${*:-"parse de_dom_parity typed_shapes"}
+targets=${*:-"parse de_dom_parity typed_shapes lazy_parity"}
 
 total_execs=0
 for t in $targets; do

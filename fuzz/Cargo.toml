@@ -28,6 +28,13 @@ name  = "typed_shapes"
 path  = "fuzz_targets/typed_shapes.rs"
 test  = false
 
+[[bin]]
+bench = false
+doc   = false
+name  = "lazy_parity"
+path  = "fuzz_targets/lazy_parity.rs"
+test  = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 serde         = { version = "1", features = ["derive"] }

@@ -16,6 +16,7 @@ Targets:
 - `parse`: `from_slice` must never panic; compact and pretty serialization of a parsed DOM must reparse to an equal DOM (NaN-tolerant), and `Display` must render the same bytes as `to_string`.
 - `de_dom_parity`: the typed (serde) walk and the DOM walk must agree on every input — equal DOMs on success, equal errors on failure. This target found the stage-2 string-arm error-ordering divergence fixed alongside it.
 - `typed_shapes`: fixed Rust shapes (`struct` with skipped members, `Vec<Option<u8>>`, `HashMap<String, i64>`, a tuple, an enum) driving the typed surface that `deserialize_any` never reaches: seq/map access, O(1) `Option` null probing, enum forms, and the validate-and-skip machinery. Errors are expected and ignored; only panics and hangs are bugs.
+- `lazy_parity`: `get` must never panic on any input, and on every document the DOM parser accepts the located values (root, top-level members/elements, one level below each container) must agree with the DOM on kind predicates, accessors and the reparsed DOM; absent keys and out-of-range indices must miss.
 
 The serde-walking targets (`de_dom_parity`, `typed_shapes`) pre-scan input depth and skip documents deeper than 200 containers: the serde walk recurses through visitor frames (~32 KiB per level) and overflows the fuzz runner's 8 MiB stack by design near `MAX_DEPTH`.
 
