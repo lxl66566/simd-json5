@@ -137,6 +137,7 @@ pub(crate) fn container_counts(bytes: &[u8], index: &[u32]) -> Counts {
         // `bytes`: every entry is a valid input position (< bytes.len()),
         // the same contract `stage2::build` relies on for its own unchecked
         // read at each entry.
+        debug_assert!(off < bytes.len());
         let b = unsafe { *bytes.get_unchecked(off) };
         // Strings, tokens and `:` never separate container children; one
         // table test skips the common case before the structural match.

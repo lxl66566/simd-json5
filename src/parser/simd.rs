@@ -594,8 +594,11 @@ fn scan_simd<S: Simd>(
             // between `cursor` and the next decision byte is whitespace and
             // breaks a token run (mirrors the scalar `p > cursor` rule).
             let mut cursor = pos;
+            // `special` and `tok` hold for the whole block; fold their union
+            // once instead of re-deriving it every iteration.
+            let not_rare = !(special | tok);
             while attn != 0 {
-                let rare = attn & !special & !tok;
+                let rare = attn & not_rare;
                 let cut = if rare == 0 {
                     64
                 } else {

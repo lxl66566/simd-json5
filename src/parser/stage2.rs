@@ -86,6 +86,7 @@ pub(crate) fn build<'a>(bytes: &'a [u8], index: &[u32], spans: &[Span]) -> Resul
         // `bytes`: every entry is a valid input position (< bytes.len()).
         // `build` is pub(crate) and only called by `parser::parse`, right
         // after index construction over the same slice.
+        debug_assert!(off < bytes.len());
         let b = unsafe { *bytes.get_unchecked(off) };
         match b {
             b'{' | b'[' => {
