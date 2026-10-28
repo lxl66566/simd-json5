@@ -139,25 +139,105 @@ fn parse_hex(digits: &[u8], neg: bool, offset: usize) -> Result<Num> {
     }))
 }
 
+/// 10^n for the SWAR digit batches, indexed by the batch digit count 1..=8.
+const POW10: [u64; 9] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+];
+
+/// Value and length of the leading ASCII-digit run in an 8-byte word, SWAR
+/// style (no per-byte branch). A count of 0 means the first byte is not a
+/// digit. Borrow and carry inside the two wrapping word ops can only corrupt
+/// bytes at or above the first non-digit byte, which the run never reaches,
+/// so the flagged positions are exact. The word is read little-endian over
+/// the input slice (see `parse_decimal`), so `from_le_bytes` semantics hold
+/// on every target.
+#[inline]
+fn leading_digits(word: u64) -> (u64, usize) {
+    let non_digit = (word.wrapping_add(0x4646_4646_4646_4646)
+        | word.wrapping_sub(0x3030_3030_3030_3030))
+        & 0x8080_8080_8080_8080;
+    if non_digit == 0 {
+        return (u64::from(parse_eight_digits(word)), 8);
+    }
+    let n = (non_digit.trailing_zeros() / 8) as usize;
+    if n == 0 {
+        return (0, 0);
+    }
+    // Mask off the bytes past the run, left-justify the digits and combine
+    // them with the same shift-and-add chain as `parse_eight_digits`.
+    let mut d = word.wrapping_sub(0x3030_3030_3030_3030);
+    d &= (1_u64 << (n * 8)) - 1;
+    d <<= (8 - n) * 8;
+    d = (d.wrapping_mul(10).wrapping_add(d >> 8)) & 0x00ff_00ff_00ff_00ff;
+    d = (d.wrapping_mul(100).wrapping_add(d >> 16)) & 0x0000_ffff_0000_ffff;
+    d = d.wrapping_mul(10_000).wrapping_add(d >> 32);
+    // In range by construction: the chain ends with the 1..=8 digit value in
+    // the low 32 bits (at most 99,999,999).
+    #[allow(clippy::cast_possible_truncation)]
+    (u64::from(d as u32), n)
+}
+
+/// Value of exactly 8 ASCII digits in one u64 word, shift-and-add SWAR
+/// (the simdjson `parse_eight_digits_unrolled` chain).
+#[inline]
+#[allow(clippy::cast_possible_truncation)] // eight digits are at most 99,999,999
+fn parse_eight_digits(word: u64) -> u32 {
+    let mut val = word.wrapping_sub(0x3030_3030_3030_3030);
+    val = (val.wrapping_mul(10).wrapping_add(val >> 8)) & 0x00ff_00ff_00ff_00ff;
+    val = (val.wrapping_mul(100).wrapping_add(val >> 16)) & 0x0000_ffff_0000_ffff;
+    val.wrapping_mul(10_000).wrapping_add(val >> 32) as u32
+}
+
 /// Unsigned decimal per ECMAScript 5.1, sign already stripped. One
 /// validating pass that also accumulates the integer digits; the frac/exp
 /// layout is read off the stop positions afterwards.
 fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Num> {
-    // Integer part: consume and accumulate in one pass. On overflow keep
-    // consuming (validation continues) and fall back to lib_parse below.
+    // Integer part: consume and accumulate in one pass. SWAR batches of
+    // eight digits while at least eight bytes remain, a byte-wise tail for
+    // the final stretch. A partial batch (count < 8) hit a non-digit byte,
+    // so the integer part ends there; on overflow keep consuming
+    // (validation continues) and fall back to lib_parse below.
     let mut i = 0;
     let mut acc: u64 = 0;
     let mut overflow = false;
-    while i < s.len() && s[i].is_ascii_digit() {
-        if !overflow {
-            let v = u64::from(s[i] - b'0');
-            if let Some(a) = acc.checked_mul(10).and_then(|a| a.checked_add(v)) {
-                acc = a;
-            } else {
-                overflow = true;
+    loop {
+        if s.len() - i >= 8 {
+            let word = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+            let (v, count) = leading_digits(word);
+            if count == 0 {
+                break;
             }
+            if !overflow {
+                match acc.checked_mul(POW10[count]).and_then(|a| a.checked_add(v)) {
+                    Some(a) => acc = a,
+                    None => overflow = true,
+                }
+            }
+            i += count;
+            if count < 8 {
+                break;
+            }
+        } else if i < s.len() && s[i].is_ascii_digit() {
+            if !overflow {
+                let v = u64::from(s[i] - b'0');
+                if let Some(a) = acc.checked_mul(10).and_then(|a| a.checked_add(v)) {
+                    acc = a;
+                } else {
+                    overflow = true;
+                }
+            }
+            i += 1;
+        } else {
+            break;
         }
-        i += 1;
     }
     let int_digits = i;
     let mut frac_digits = 0;
@@ -166,6 +246,10 @@ fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Num> {
         had_dot = true;
         i += 1;
         let from = i;
+        // Fraction digits are only counted here: long mantissas (canada's
+        // 17-18 significant digits) can never serve the fast path below, so
+        // the significant is accumulated in a second pass only when the
+        // digit count leaves the fast path reachable.
         while i < s.len() && s[i].is_ascii_digit() {
             i += 1;
         }
@@ -179,18 +263,28 @@ fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Num> {
         return Err(invalid_number(offset));
     }
     let mut had_exp = false;
+    let mut exp_value: i64 = 0;
+    let mut exp_neg = false;
     if matches!(s.get(i), Some(&(b'e' | b'E'))) {
         i += 1;
         if matches!(s.get(i), Some(&(b'+' | b'-'))) {
+            exp_neg = s[i] == b'-';
             i += 1;
         }
-        // `1e` and `1e+` are rejected.
+        // `1e` and `1e+` are rejected. The value saturates: any exponent
+        // outside the fast-path window falls back to lib_parse, which
+        // evaluates it exactly.
         let from = i;
         while i < s.len() && s[i].is_ascii_digit() {
+            let d = i64::from(s[i] - b'0');
+            exp_value = exp_value.saturating_mul(10).saturating_add(d);
             i += 1;
         }
         if i == from {
             return Err(invalid_number(offset));
+        }
+        if exp_neg {
+            exp_value = -exp_value;
         }
         had_exp = true;
     }
@@ -199,6 +293,37 @@ fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Num> {
         return Err(invalid_number(offset));
     }
     if had_dot || had_exp {
+        // Fast path: at most 16 significant digit positions (a conservative
+        // bound: leading zeros are counted, and a 17th digit always exceeds
+        // 2^53) and no accumulation overflow in the integer part. The
+        // significant is accumulated now — never for mantissas that long —
+        // and both `significant as f64` and every power of ten up to 10^22
+        // are exact in f64 (5^22 still fits the 53-bit mantissa), so the
+        // single multiply or divide is correctly rounded to the decimal
+        // value.
+        if !overflow
+            && int_digits.saturating_add(frac_digits) <= 16
+            && let Ok(frac) = i64::try_from(frac_digits)
+            // The exponent may saturate at the i64 edge; the subtraction
+            // itself must not overflow (a saturated exponent is far outside
+            // the window, so it just falls back).
+            && let Some(dec_exp) = exp_value.checked_sub(frac)
+            && (-22..=22).contains(&dec_exp)
+        {
+            // Second pass over the mantissa (the integer and fraction
+            // digits, dot skipped): at most 16 digits, so the accumulation
+            // cannot overflow.
+            let mantissa_end = int_digits + usize::from(had_dot) + frac_digits;
+            let mut significant: u64 = 0;
+            for &b in &s[..mantissa_end] {
+                if b.is_ascii_digit() {
+                    significant = significant * 10 + u64::from(b - b'0');
+                }
+            }
+            if significant <= MAX_SIGNIFICANT_FAST {
+                return Ok(Num::F64(signed(neg, pow10_fast(significant, dec_exp))));
+            }
+        }
         // Fraction layout facts come straight from the validation pass; no
         // second scan for the dot position.
         let leading_dot = int_digits == 0;
@@ -231,6 +356,33 @@ fn signed(neg: bool, f: f64) -> f64 {
         -f
     } else {
         f
+    }
+}
+
+/// Largest mantissa the fast float path accepts: `acc as f64` is exact up to
+/// and including 2^53.
+const MAX_SIGNIFICANT_FAST: u64 = 1 << 53;
+
+/// Powers of ten, each exactly representable in f64 (5^22 still fits the
+/// 53-bit mantissa, 5^23 does not), indexed by the exponent 0..=22.
+const POW10_F64: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// `significant * 10^exp` for the fast path: `significant <= 2^53` and
+/// `|exp| <= 22`, so both operands are exact in f64 and the single multiply
+/// or divide (IEEE-correctly rounded on their exact product or quotient,
+/// which is the decimal value itself) yields the correctly rounded result.
+#[allow(clippy::cast_precision_loss)] // exact: significant <= 2^53
+fn pow10_fast(significant: u64, exp: i64) -> f64 {
+    let d = significant as f64;
+    // In range by the caller's contract: |exp| <= 22.
+    let idx = usize::try_from(exp.unsigned_abs()).expect("exp in [-22, 22]");
+    if exp >= 0 {
+        d * POW10_F64[idx]
+    } else {
+        d / POW10_F64[idx]
     }
 }
 
@@ -308,6 +460,137 @@ mod tests {
 
     fn err(t: &str) -> Error {
         parse(t.as_bytes(), 0).unwrap_err()
+    }
+
+    #[test]
+    fn swar_batch_boundaries() {
+        // One batch.
+        assert_eq!(num("99999999"), Value::U64(99_999_999));
+        assert_eq!(num("10000000"), Value::U64(10_000_000));
+        // Batch plus tail digits.
+        assert_eq!(num("123456789"), Value::U64(123_456_789));
+        assert_eq!(num("123456789012345"), Value::U64(123_456_789_012_345));
+        // Two full batches.
+        assert_eq!(num("1234567890123456"), Value::U64(1_234_567_890_123_456));
+        // Two batches plus tail, filling u64 exactly and overflowing past it.
+        assert_eq!(num("18446744073709551615"), Value::U64(u64::MAX));
+        assert_eq!(
+            num("18446744073709551616"),
+            Value::F64(1.844_674_407_370_955_2e19)
+        );
+        // Non-digit inside a scanned word ends the run at the word.
+        assert_eq!(num("1234567.5"), Value::F64(1_234_567.5));
+        assert_eq!(num("12345678.5"), Value::F64(12_345_678.5));
+        assert_eq!(num("12345678.25"), Value::F64(12_345_678.25));
+        // A digit run stopped by an exponent byte mid-word.
+        assert_eq!(num("1234567e3"), Value::F64(1_234_567e3));
+    }
+
+    /// The SWAR batch accumulation must agree with a plain digit-by-digit
+    /// accumulation for every length around the 8- and 16-byte batch
+    /// boundaries, including values that overflow u64.
+    #[test]
+    #[allow(clippy::float_cmp)] // exactness against std parsing is the point
+    fn swar_accumulation_matches_naive() {
+        let naive = |t: &str| -> Option<u64> {
+            let mut acc: u64 = 0;
+            for b in t.bytes() {
+                let (a, o1) = acc.overflowing_mul(10);
+                let (a, o2) = a.overflowing_add(u64::from(b - b'0'));
+                if o1 || o2 {
+                    return None;
+                }
+                acc = a;
+            }
+            Some(acc)
+        };
+        for len in 1..=22 {
+            let t: String = (0..len)
+                .map(|k| char::from(b'0' + u8::try_from(k % 10).unwrap()))
+                .collect();
+            let expect = naive(&t);
+            let got = num(&t);
+            match expect {
+                Some(v) => assert_eq!(got, Value::U64(v), "len {len}"),
+                None => assert!(
+                    matches!(got, Value::F64(f) if f == t.parse::<f64>().unwrap()),
+                    "len {len}"
+                ),
+            }
+            // The same digits followed by a fraction: the integer run stops
+            // at the dot, at every alignment against the 8-byte words.
+            let split = format!("{t}.5");
+            assert_eq!(
+                num(&split),
+                Value::F64(t.parse::<f64>().unwrap() + 0.5),
+                "len {len}"
+            );
+        }
+    }
+
+    /// The power-of-ten fast path must agree with std's correctly rounded
+    /// parse across its whole window: every exponent in [-22, 22] on both
+    /// the dot and the `e` spelling, mantissas around 2^53, leading and
+    /// trailing zeros, and the fallback just outside the window.
+    #[test]
+    #[allow(clippy::float_cmp)] // exactness against std parsing is the point
+    fn pow10_fast_path_matches_std() {
+        let mantissas = [
+            1_u64,
+            2,
+            5,
+            9,
+            12345,
+            999_999_999,
+            9_007_199_254_740_991,
+            1 << 53,
+        ];
+        for &m in &mantissas {
+            for exp in -22_i64..=22 {
+                let token = format!("{m}e{exp}");
+                let expect: f64 = token.parse().unwrap();
+                assert_eq!(num(&token), Value::F64(expect), "{token}");
+                // The same value with the dot shifted instead of an exponent.
+                let digits = m.to_string();
+                let shift = usize::try_from(exp.unsigned_abs()).unwrap();
+                let dot = if exp >= 0 {
+                    format!("{digits}{}.", "0".repeat(shift))
+                } else {
+                    let frac = shift;
+                    if frac >= digits.len() {
+                        format!("0.{}{digits}", "0".repeat(frac - digits.len()))
+                    } else {
+                        let at = digits.len() - frac;
+                        format!("{}.{}", &digits[..at], &digits[at..])
+                    }
+                };
+                assert_eq!(num(&dot), Value::F64(expect), "{dot}");
+            }
+        }
+        // Just outside the window: mantissa and exponent fallbacks, and the
+        // saturated exponent parse.
+        assert_eq!(num("1e23"), Value::F64(1e23));
+        assert_eq!(num("1e-23"), Value::F64(1e-23));
+        assert_eq!(
+            num("9007199254740993.0"),
+            Value::F64(9_007_199_254_740_992.0)
+        );
+        assert_eq!(num("1e99999999999999999999"), Value::F64(f64::INFINITY));
+        assert_eq!(num("1e-99999999999999999999"), Value::F64(0.0));
+        // A saturated exponent combined with a fraction digit must not
+        // overflow the decimal-exponent subtraction (found by the parse
+        // fuzz targets).
+        assert_eq!(num("1.5e99999999999999999999"), Value::F64(f64::INFINITY));
+        assert_eq!(num("1.5e-99999999999999999999"), Value::F64(0.0));
+        assert_eq!(num("-1.5e-99999999999999999999"), Value::F64(-0.0));
+        assert_eq!(
+            num("1.7976931348623157e-32007199252007199254740993"),
+            Value::F64(
+                "1.7976931348623157e-32007199252007199254740993"
+                    .parse::<f64>()
+                    .unwrap()
+            )
+        );
     }
 
     #[test]
