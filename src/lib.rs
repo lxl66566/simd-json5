@@ -25,9 +25,11 @@ pub mod de;
 #[cfg(feature = "serde")]
 pub mod typed;
 
+mod lazy;
 mod parser;
 
 pub use error::{Error, Result};
+pub use lazy::{LazyValue, get};
 pub use ser::{to_string, to_string_pretty, to_vec};
 pub use value::{MAX_DEPTH, Map, Str, Value};
 

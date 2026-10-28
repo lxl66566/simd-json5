@@ -640,7 +640,7 @@ fn hex4(bytes: &[u8], at: usize) -> Option<u16> {
 /// (`from_str` receives a `&str`, `from_slice` validates at entry), and both
 /// ends of every slice taken here are either ASCII bytes or positions
 /// produced by `decode_seq`, which consumes whole UTF-8 sequences.
-fn str_slice(bytes: &[u8], a: usize, b: usize) -> &str {
+pub(crate) fn str_slice(bytes: &[u8], a: usize, b: usize) -> &str {
     let raw = &bytes[a..b];
     debug_assert!(core::str::from_utf8(raw).is_ok());
     // SAFETY: valid UTF-8 by the contract above; the debug_assert pins it.
