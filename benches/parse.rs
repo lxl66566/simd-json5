@@ -38,7 +38,6 @@ fn sonic_available() -> bool {
 fn bench_parse(c: &mut Criterion) {
     for (name, is_json) in CORPORA {
         let text = corpus(name);
-        let bytes = text.as_bytes().to_vec();
         let mut group = c.benchmark_group(format!("parse/{name}"));
         group.throughput(Throughput::Bytes(text.len() as u64));
 
@@ -72,6 +71,7 @@ fn bench_parse(c: &mut Criterion) {
 
             // simd-json mutates its input, so each iteration gets a private
             // copy prepared outside the measured routine.
+            let bytes = text.as_bytes().to_vec();
             group.bench_function("simd-json", |b| {
                 b.iter_batched(
                     || bytes.clone(),
