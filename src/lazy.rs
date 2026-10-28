@@ -113,8 +113,12 @@ fn value_delivered(stack: &mut [Open]) {
 /// consumes the byte after it), and separator placement. `end` is just
 /// past the value's last byte. Escape grammar and token spelling are not
 /// validated here; the accessors validate whatever they return.
-fn value_range(bytes: &[u8], from: usize) -> Result<(usize, usize)> {
-    let mut stack: Vec<Open> = Vec::with_capacity(16);
+///
+/// `stack` is caller-owned scratch for the open-container walk; it is
+/// cleared on entry (including after an error return), so a caller that
+/// walks one member at a time reuses a single allocation.
+fn value_range(bytes: &[u8], from: usize, stack: &mut Vec<Open>) -> Result<(usize, usize)> {
+    stack.clear();
     let mut i = skip_seps(bytes, from)?;
     let start = i;
     if i >= bytes.len() {
@@ -128,7 +132,7 @@ fn value_range(bytes: &[u8], from: usize) -> Result<(usize, usize)> {
         let b = bytes[i];
         match b {
             b'{' | b'[' => {
-                check_value_position(&stack, i)?;
+                check_value_position(stack, i)?;
                 if stack.len() >= MAX_DEPTH {
                     return Err(Error::DepthLimitExceeded {
                         limit: MAX_DEPTH,
@@ -170,7 +174,7 @@ fn value_range(bytes: &[u8], from: usize) -> Result<(usize, usize)> {
                 if stack.is_empty() {
                     return Ok((start, i));
                 }
-                value_delivered(&mut stack);
+                value_delivered(stack);
             },
             b',' => {
                 match stack.last_mut() {
@@ -215,7 +219,7 @@ fn value_range(bytes: &[u8], from: usize) -> Result<(usize, usize)> {
                     })
                 );
                 if !is_key {
-                    check_value_position(&stack, i)?;
+                    check_value_position(stack, i)?;
                 }
                 let (end, _) = skip_string(bytes, i)?;
                 if is_key {
@@ -226,7 +230,7 @@ fn value_range(bytes: &[u8], from: usize) -> Result<(usize, usize)> {
                     if stack.is_empty() {
                         return Ok((start, end));
                     }
-                    value_delivered(&mut stack);
+                    value_delivered(stack);
                 }
                 i = end;
             },
@@ -243,11 +247,11 @@ fn value_range(bytes: &[u8], from: usize) -> Result<(usize, usize)> {
                     }
                     *state = ObjState::Colon;
                 } else {
-                    check_value_position(&stack, i)?;
+                    check_value_position(stack, i)?;
                     if stack.is_empty() {
                         return Ok((start, end));
                     }
-                    value_delivered(&mut stack);
+                    value_delivered(stack);
                 }
                 i = end;
             },
@@ -381,8 +385,9 @@ impl<'a> LazyValue<'a> {
             ))),
             b'{' | b'[' => Ok(None),
             _ => {
-                let end = token_end(self.bytes, self.start);
-                stage2::token_value(&self.bytes[self.start..end], self.start).map(Some)
+                // For a token the range end is the token end located by the
+                // walk that produced this value; no rescan needed.
+                stage2::token_value(&self.bytes[self.start..self.end], self.start).map(Some)
             },
         }
     }
@@ -422,7 +427,8 @@ impl core::fmt::Display for LazyValue<'_> {
 /// ```
 pub fn get<'a>(src: &'a str, path: &[&str]) -> Result<Option<LazyValue<'a>>> {
     let bytes = src.as_bytes();
-    let (mut start, mut end) = value_range(bytes, 0)?;
+    let mut stack: Vec<Open> = Vec::with_capacity(16);
+    let (mut start, mut end) = value_range(bytes, 0, &mut stack)?;
     let rest = skip_seps(bytes, end)?;
     if rest != bytes.len() {
         return Err(Error::TrailingCharacters { offset: rest });
@@ -469,6 +475,7 @@ fn object_member(
 ) -> Result<Option<(usize, usize)>> {
     let body_end = end - 1; // at the closing `}`
     let mut i = skip_seps(bytes, start + 1)?;
+    let mut stack: Vec<Open> = Vec::with_capacity(16);
     let mut found = None;
     while i < body_end {
         // The key: stage-2 parsing gives the exact DOM spelling semantics.
@@ -490,7 +497,7 @@ fn object_member(
             return Err(syntax("expected ':'", i));
         }
         i = skip_seps(bytes, i + 1)?;
-        let (vstart, vend) = value_range(bytes, i)?;
+        let (vstart, vend) = value_range(bytes, i, &mut stack)?;
         if key_str.as_str() == key {
             found = Some((vstart, vend));
         }
@@ -515,9 +522,10 @@ fn array_element(
 ) -> Result<Option<(usize, usize)>> {
     let body_end = end - 1; // at the closing `]`
     let mut i = skip_seps(bytes, start + 1)?;
+    let mut stack: Vec<Open> = Vec::with_capacity(16);
     let mut n = 0;
     while i < body_end {
-        let (vstart, vend) = value_range(bytes, i)?;
+        let (vstart, vend) = value_range(bytes, i, &mut stack)?;
         if n == index {
             return Ok(Some((vstart, vend)));
         }
@@ -637,9 +645,20 @@ mod tests {
         assert!(get_ok("NaN", &[]).unwrap().is_number());
         assert!(get_ok("-Infinity", &[]).unwrap().is_number());
         assert!(get_ok("[NaN, 1, Infinity]", &["2"]).unwrap().is_number());
-        assert!(get_ok("NaN", &[]).unwrap().as_f64().unwrap().unwrap().is_nan());
+        assert!(
+            get_ok("NaN", &[])
+                .unwrap()
+                .as_f64()
+                .unwrap()
+                .unwrap()
+                .is_nan()
+        );
         assert_eq!(
-            get_ok("[Infinity]", &["0"]).unwrap().as_f64().unwrap().unwrap(),
+            get_ok("[Infinity]", &["0"])
+                .unwrap()
+                .as_f64()
+                .unwrap()
+                .unwrap(),
             f64::INFINITY
         );
         // Keywords and strings are not numbers.
