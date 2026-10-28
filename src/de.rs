@@ -25,12 +25,14 @@
 //! assert_eq!((p.x, p.y), (1, 2));
 //! ```
 
+use std::cell::OnceCell;
+
 use serde::de::{self, DeserializeSeed, Unexpected, Visitor};
 
 use crate::{
     Error, Result,
     parser::{
-        container_counts, initial_index_capacity,
+        Counts, container_counts, initial_index_capacity,
         number::{self, Num},
         simd,
         stage1::{CLASSES, Span, class, token_end},
@@ -48,8 +50,7 @@ where
     let mut index = Vec::with_capacity(initial_index_capacity(s.len()));
     let mut spans = Vec::new();
     simd::build_index(s.as_bytes(), &mut index, &mut spans)?;
-    let counts = container_counts(s.as_bytes(), &index);
-    let mut de = Deserializer::new(s.as_bytes(), &index, counts.as_slice(), &spans);
+    let mut de = Deserializer::new(s.as_bytes(), &index, &spans);
     let value = T::deserialize(&mut de).map_err(|e| locate(e, &de))?;
     de.end()?;
     Ok(value)
@@ -138,9 +139,11 @@ struct Deserializer<'a, 'de> {
     /// [`stage2::parse_string_spanned`]).
     spans: &'a [Span],
     /// Child-count hints keyed by index position of each container opening
-    /// (see [`container_counts`]); consulted by the `size_hint` overrides of
-    /// [`SeqAccess`] and [`MapAccess`] only.
-    counts: &'a [u32],
+    /// (see [`container_counts`]); built by [`Deserializer::hint_counts`] on
+    /// the first `size_hint` request, so scalar-root and early-stop parses
+    /// never pay the whole-index scan and its allocation. Consulted by the
+    /// `size_hint` overrides of [`SeqAccess`] and [`MapAccess`] only.
+    counts: OnceCell<Counts>,
     pos: usize,
     depth: usize,
     ctx: Ctx,
@@ -152,17 +155,26 @@ struct Deserializer<'a, 'de> {
 }
 
 impl<'a, 'de> Deserializer<'a, 'de> {
-    fn new(bytes: &'de [u8], index: &'a [u32], counts: &'a [u32], spans: &'a [Span]) -> Self {
+    fn new(bytes: &'de [u8], index: &'a [u32], spans: &'a [Span]) -> Self {
         Self {
             bytes,
             index,
             spans,
-            counts,
+            counts: OnceCell::new(),
             pos: 0,
             depth: 0,
             ctx: Ctx::Top,
             started: false,
         }
+    }
+
+    /// The counts table, computing it on first request. `container_counts`
+    /// reads only the immutable input and index, so deferring it cannot
+    /// change what it returns.
+    fn hint_counts(&self) -> &[u32] {
+        self.counts
+            .get_or_init(|| container_counts(self.bytes, self.index))
+            .as_slice()
     }
 
     /// String value at the quote entry `off`: borrowed straight from the
@@ -747,8 +759,9 @@ impl<'de> de::SeqAccess<'de> for SeqAccess<'_, '_, 'de> {
         // The element count recorded when this array opened. Visitors read
         // it before the first element (serde's Vec visitor calls it once);
         // afterwards it stays a safe upper bound (trailing comma). `None`
-        // when the table was skipped for a tiny document.
-        self.de.counts.get(self.open).map(|&c| c as usize)
+        // when the table was skipped for a tiny document; an unclosed
+        // container keeps a recorded 0 and yields a zero-valued hint.
+        self.de.hint_counts().get(self.open).map(|&c| c as usize)
     }
 }
 
@@ -787,7 +800,7 @@ impl<'de> de::MapAccess<'de> for MapAccess<'_, '_, 'de> {
 
     fn size_hint(&self) -> Option<usize> {
         // Like the seq case; duplicate keys can only over-estimate.
-        self.de.counts.get(self.open).map(|&c| c as usize)
+        self.de.hint_counts().get(self.open).map(|&c| c as usize)
     }
 }
 
