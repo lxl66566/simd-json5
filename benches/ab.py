@@ -18,9 +18,7 @@ alternation. Defaults are a quick configuration (20 samples, 1 s warmup,
 values for a firmer record. Manual `cargo bench` runs keep criterion's
 defaults.
 
-The suite itself skips `json5` on canada.json (quadratic on long float
-arrays, one-shot measured via examples/one_shot.rs instead); the A/B only
-runs this crate's benchmarks anyway.
+The A/B only runs this crate's benchmarks.
 
 Metadata is limited to what is collectable automatically (date, cpu, rustc,
 os, commits, corpus sizes); the human-written fields of older records (kind,

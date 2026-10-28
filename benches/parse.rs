@@ -45,16 +45,9 @@ fn bench_parse(c: &mut Criterion) {
             b.iter(|| black_box(simd_json5::from_str(black_box(&text)).unwrap()));
         });
 
-        // `json5` is quadratic on canada.json's long float arrays (~65 s per
-        // parse; criterion needs >=10 samples), so it is only measured as a
-        // one-shot single sample via examples/one_shot.rs instead.
-        if name != "canada.json" {
-            group.bench_function("json5", |b| {
-                b.iter(|| {
-                    black_box(json5::from_str::<serde_json::Value>(black_box(&text)).unwrap())
-                });
-            });
-        }
+        group.bench_function("json5", |b| {
+            b.iter(|| black_box(json5::from_str::<serde_json::Value>(black_box(&text)).unwrap()));
+        });
 
         group.bench_function("serde-json5", |b| {
             b.iter(|| {

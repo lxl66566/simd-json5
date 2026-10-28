@@ -6,9 +6,10 @@
 """Collect criterion results into benches/results/ and render SVG charts.
 
 Reads target/criterion/**/new/estimates.json written by
-`cargo bench --bench parse --bench serialize`, folds in the single-sample
-entries from benches/results/one_shot.jsonl, and writes a dated JSON record
-plus parse.svg / serialize.svg throughput charts for the README.
+`cargo bench --bench parse --bench serialize` and writes the JSON record
+plus parse.svg / serialize.svg throughput charts for the README. The record
+file has a fixed name so the repo carries exactly one latest benchmark
+record.
 
 Throughput uses the median (robust against tail noise, matching ab.py); the
 mean is kept in the record for reference.
@@ -44,7 +45,7 @@ REPO = Path(__file__).resolve().parents[1]
 CRITERION = REPO / "target" / "criterion"
 DATA = REPO / "benches" / "data"
 RESULTS = REPO / "benches" / "results"
-ONE_SHOT = RESULTS / "one_shot.jsonl"
+RECORD = RESULTS / "benchmarks.json"
 
 CORPORA = ["twitter.json", "citm_catalog.json", "canada.json", "json5.json5"]
 IMPLS = ["simd-json5", "json5", "serde-json5", "serde_json", "simd-json", "sonic-rs"]
@@ -103,12 +104,6 @@ def run_benches(args: argparse.Namespace) -> None:
     subprocess.run(cmd, cwd=REPO, check=True)
 
 
-def collect_one_shot() -> list[dict]:
-    if not ONE_SHOT.is_file():
-        return []
-    return [json.loads(line) for line in ONE_SHOT.read_text().splitlines() if line.strip()]
-
-
 def environment() -> dict:
     cpu = platform.processor() or "unknown"
     if Path("/proc/cpuinfo").is_file():
@@ -164,7 +159,7 @@ def plot(record: dict, bench: str, path: Path) -> None:
     )
 
     for ax, (corpus, rows) in zip(axes.flat, cells):
-        names = [r["impl"] + ("*" if r.get("one_shot") else "") for r in rows]
+        names = [r["impl"] for r in rows]
         values = [r["mb_s"] for r in rows]
         colors = [color(r["impl"]) for r in rows]
         y = range(len(rows))
@@ -201,8 +196,7 @@ def plot(record: dict, bench: str, path: Path) -> None:
     )
     fig.text(
         0.5, 0.004,
-        f"* single sample, measured outside criterion   |   {record['cpu']}   |   "
-        f"{record['rustc'].split(' (')[0]}   |   {record['date']}",
+        f"{record['cpu']}   |   {record['rustc'].split(' (')[0]}   |   {record['date']}",
         ha="center", fontsize=7.5, color="#555",
     )
     fig.savefig(path)
@@ -248,7 +242,7 @@ def main() -> None:
 
     if not CRITERION.is_dir():
         sys.exit("target/criterion not found; run `cargo bench --bench parse --bench serialize` first")
-    results = collect_criterion() + collect_one_shot()
+    results = collect_criterion()
     if not results:
         sys.exit("no comparison estimates found; run the parse and serialize benches first")
 
@@ -267,7 +261,7 @@ def main() -> None:
     )
 
     RESULTS.mkdir(parents=True, exist_ok=True)
-    out = RESULTS / f"{record['date']}.json"
+    out = RECORD
     out.write_text(json.dumps(record, indent=2) + "\n")
     for bench in ("parse", "serialize"):
         if any(r["benchmark"] == bench for r in results):
