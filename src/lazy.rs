@@ -13,7 +13,9 @@
 use crate::{
     Error, Result,
     parser::{
-        stage1::{decode_seq, is_unicode_whitespace, skip_comment, skip_string, token_end},
+        stage1::{
+            CLASSES, class, decode_seq, is_unicode_whitespace, skip_comment, skip_string, token_end,
+        },
         stage2,
     },
     value::{MAX_DEPTH, Str, Value},
@@ -50,6 +52,8 @@ enum Open {
 
 /// Position of the first decision point (non-separator byte) at or after
 /// `from`: ASCII whitespace, comments and Unicode whitespace are skipped.
+/// Bytes outside strings and comments that are neither separators nor
+/// token bytes are rejected with the DOM parser's stage-1 error.
 fn skip_seps(bytes: &[u8], mut i: usize) -> Result<usize> {
     loop {
         match bytes.get(i) {
@@ -65,8 +69,13 @@ fn skip_seps(bytes: &[u8], mut i: usize) -> Result<usize> {
                 _ => return Ok(i),
             },
             // Token bytes stop the scan; malformed UTF-8 cannot occur (the
-            // input is a `&str`).
-            _ => return Ok(i),
+            // input is a `&str`). Every other ASCII byte is outside the
+            // stage-1 alphabet (separators and token bytes), so it errors
+            // here exactly like the DOM parser.
+            Some(&b) if CLASSES[b as usize] & class::TOKEN != 0 => return Ok(i),
+            Some(&b) => {
+                return Err(Error::UnexpectedChar { byte: b, offset: i });
+            },
         }
     }
 }
@@ -408,10 +417,17 @@ impl core::fmt::Display for LazyValue<'_> {
 ///
 /// The walk validates the document's structure — container pairing and
 /// member state, string extents (a backslash consumes the byte after it),
-/// separator placement, nesting depth — and stops there: members that are
-/// skipped over are not grammar-checked (an invalid escape inside a
-/// non-matching string is not reported). The returned value validates its
-/// own grammar through its accessors, exactly like the DOM parser.
+/// separator placement, nesting depth, and the byte alphabet outside
+/// strings and comments (any byte that is neither a separator nor a token
+/// byte is rejected with the DOM parser's error) — and stops there:
+/// members that are skipped over are not grammar-checked (an invalid
+/// escape inside a non-matching string is not reported). The returned
+/// value validates its own grammar through its accessors, exactly like
+/// the DOM parser. One divergence in error selection remains: the walk is
+/// a single pass, so a structural error early in the document can be
+/// reported before an illegal byte further along, where the DOM parser's
+/// full stage-1 scan reports the illegal byte first; both parsers reject
+/// the document either way.
 ///
 /// ```
 /// let src = r#"{ "artist": { name: 'Helen', tags: ["a", "b",] } }"#;
@@ -706,6 +722,34 @@ mod tests {
             byte: b'/',
             offset: 0
         });
+    }
+
+    /// Illegal bytes error with the DOM parser's kind and offset in every
+    /// position the walk reaches: token position, member key and trailing
+    /// garbage all match `from_str`.
+    #[test]
+    fn illegal_bytes_match_dom() {
+        let cases = [
+            "!",
+            "null!",
+            "1 !",
+            "{a:1, !: 2}",
+            "{!: 1}",
+            "[1, @]",
+            "{a: (1)}",
+        ];
+        for src in cases {
+            let dom = crate::from_str(src).unwrap_err();
+            assert_eq!(get_err(src, &[]), dom, "root walk: {src}");
+            assert_eq!(get_err(src, &["a"]), dom, "descend: {src}");
+        }
+        // A structural error before the illegal byte wins the single-pass
+        // walk; the DOM parser's full stage-1 scan reports the byte. Both
+        // reject the document.
+        assert_eq!(
+            get_err("[1 2 !]", &[]),
+            crate::from_str("[1 2]").unwrap_err()
+        );
     }
 
     /// Deep nesting hits the depth limit instead of overflowing the stack
