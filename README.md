@@ -37,7 +37,7 @@ DOM parse and serialize:
 ```rust
 // Unquoted keys, comments, trailing commas, hex, Infinity all parse.
 let value = simd_json5::from_str("{ a: 1, // comment\n  b: [2, 3,] }").unwrap();
-assert_eq!(value["b"][0], simd_json5::Value::I64(2));
+assert_eq!(value["b"][0], simd_json5::Value::U64(2));
 
 let text = simd_json5::to_string(&value); // {"a":1,"b":[2,3]}
 let pretty = simd_json5::to_string_pretty(&value);

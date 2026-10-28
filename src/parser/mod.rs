@@ -112,8 +112,8 @@ impl Drop for Counts {
 /// containers, trailing commas) the values are merely harmless capacity
 /// upper bounds, and stage 2 rejects the document regardless. An empty
 /// container records 1 and a trailing comma over-counts by one; capacity is
-/// invisible, so both are safe. Openings that never close keep 0, which
-/// consumers treat as "no hint".
+/// invisible, so both are safe. Openings that never close keep 0, a
+/// zero-valued hint that reserves no capacity.
 ///
 /// Scratch cost: 4 bytes per index entry plus the pass itself, which only
 /// classifies the byte at each entry — far cheaper than the parse.

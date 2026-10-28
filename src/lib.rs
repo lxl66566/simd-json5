@@ -13,7 +13,7 @@
 //!
 //! ```
 //! let value = simd_json5::from_str("{ a: 1, // comment\n  b: [2, 3,] }").unwrap();
-//! assert_eq!(value["b"][0], simd_json5::Value::I64(2));
+//! assert_eq!(value["b"][0], simd_json5::Value::U64(2));
 //! ```
 
 pub mod error;

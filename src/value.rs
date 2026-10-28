@@ -259,7 +259,9 @@ impl<'a> Value<'a> {
         }
     }
 
-    /// Object member lookup by key, or array element lookup by index.
+    /// Object member lookup by key (array indexing uses
+    /// [`Self::get_index`]).
+    #[must_use]
     pub fn get(&self, key: impl Borrow<str>) -> Option<&Value<'a>> {
         match self {
             Self::Object(m) => m.get(key.borrow()),

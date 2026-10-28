@@ -299,36 +299,45 @@ impl<'a> LazyValue<'a> {
         stage2::str_slice(self.bytes, self.start, self.end)
     }
 
+    /// Whether the value is the `null` keyword (exact spelling).
     #[must_use]
     pub fn is_null(&self) -> bool {
         self.raw() == "null"
     }
 
+    /// Whether the value is a boolean keyword (exact spelling).
     #[must_use]
     pub fn is_bool(&self) -> bool {
         matches!(self.raw(), "true" | "false")
     }
 
+    /// Whether the value is a number, classified by the token's first
+    /// byte: every bare token is a number or a keyword, and the only
+    /// keywords starting with `N`/`I` are `NaN`/`Infinity` — themselves
+    /// numbers. A structurally valid but misspelled token (`Infinityx`)
+    /// still reports `true`; the accessors are the authoritative check.
     #[must_use]
     pub fn is_number(&self) -> bool {
-        // Every bare token is a number or a keyword, and the only keywords
-        // starting with `N`/`I` are `NaN`/`Infinity` — themselves numbers.
         matches!(
             self.bytes[self.start],
             b'+' | b'-' | b'.' | b'0'..=b'9' | b'N' | b'I'
         )
     }
 
+    /// Whether the value is a string, classified by its opening quote.
+    /// Escape grammar is validated by [`as_str`](Self::as_str).
     #[must_use]
     pub fn is_str(&self) -> bool {
         matches!(self.bytes[self.start], b'"' | b'\'')
     }
 
+    /// Whether the value is an array.
     #[must_use]
     pub fn is_array(&self) -> bool {
         self.bytes[self.start] == b'['
     }
 
+    /// Whether the value is an object.
     #[must_use]
     pub fn is_object(&self) -> bool {
         self.bytes[self.start] == b'{'
