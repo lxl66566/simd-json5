@@ -87,6 +87,59 @@ fn string_escape_word_boundaries() {
     }
 }
 
+/// The direct-write escape path (dirty strings) must match `serde_json`
+/// byte for byte: escapes inside scanned words, inside the final partial
+/// word, and long clean runs between them, at every alignment.
+#[test]
+fn dirty_string_direct_write_matches_serde_json() {
+    let ser = |s: &str| to_string(&Value::Str(Str::Static(s)));
+    for n in 0..40 {
+        let cases = [
+            format!("{}\"{}", "a".repeat(n), "b".repeat(40)),
+            format!("{}\\{}", "a".repeat(n), "b".repeat(40)),
+            format!("{}\u{1}{}", "a".repeat(n), "b".repeat(n % 9)),
+            format!("{}\t{}", "a".repeat(40), "b".repeat(n % 9)),
+            format!(
+                "{}\"{}\\{}\n{}",
+                "a".repeat(n),
+                "b".repeat(17),
+                "c".repeat(3),
+                "d".repeat(n)
+            ),
+            format!("é{}\"é{}", "é".repeat(n), "é".repeat(5)),
+        ];
+        for s in cases {
+            assert_eq!(ser(&s), serde_json::to_string(&s).unwrap(), "{s:?}");
+        }
+    }
+}
+
+/// Extreme dirty-string distributions on the direct-write path: a single
+/// escape inside multi-megabyte strings, every byte a six-byte escape, and
+/// long runs between escapes. Pinned against `serde_json` and by a parse
+/// round trip.
+#[test]
+fn dirty_string_extreme_distributions() {
+    let ser = |s: &str| to_string(&Value::Str(Str::Static(s)));
+    let single = format!("{}\"{}", "a".repeat(3 << 20), "b".repeat(3 << 20));
+    let all_six_byte = "\u{1}".repeat(1 << 12);
+    let spread = format!(
+        "{}\n{}\"{}\\{}\u{2}{}",
+        "a".repeat(1000),
+        "b".repeat(1000),
+        "c".repeat(1000),
+        "d".repeat(1000),
+        "e".repeat(1000)
+    );
+    for s in [&single, &all_six_byte, &spread] {
+        assert_eq!(ser(s), serde_json::to_string(s).unwrap(), "len {}", s.len());
+        assert_eq!(
+            simd_json5::from_str(&ser(s)).unwrap(),
+            Value::Str(Str::Static(s))
+        );
+    }
+}
+
 #[test]
 fn nesting_and_containers() {
     assert_eq!(to_string(&Value::Array(vec![])), "[]");

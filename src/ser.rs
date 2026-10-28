@@ -9,6 +9,8 @@
 //! compatible with `serde_json::to_string_pretty` on JSON-representable
 //! values.
 
+use core::{mem::MaybeUninit, ptr};
+
 use crate::value::{MAX_DEPTH, Map, Value};
 
 /// Per-byte escape classification for string contents.
@@ -23,8 +25,17 @@ static ESCAPE: [u8; 256] = build_escape_table();
 /// Index 0 is unused padding so class numbers index directly.
 const SHORT_ESCAPES: [u8; 8] = *b"\x00\"\\btnfr";
 
+/// Hex digits for `\u00XX` escapes.
+const HEX: [u8; 16] = *b"0123456789abcdef";
+
 /// Class of an arbitrary C0 control byte that has no short escape.
 const CLASS_UNICODE: u8 = 8;
+
+/// Output bytes each escape class adds on top of the input byte it
+/// replaces: 0 for passthrough, 1 for the two-byte short escapes, 5 for
+/// the six-byte `\u00XX` form. [`escaped_len`] sizes its exact reserve
+/// with this table.
+const ESCAPE_EXPANSION: [usize; 9] = [0, 1, 1, 1, 1, 1, 1, 1, 5];
 
 /// Indent run for pretty mode: two spaces per level, covering every nesting
 /// depth the parser accepts ([`MAX_DEPTH`]); deeper hand-built indentation
@@ -56,6 +67,26 @@ trait Sink {
     fn push(&mut self, byte: u8);
 
     fn extend(&mut self, bytes: &[u8]);
+
+    /// Reserve `additional` spare capacity and return it as an
+    /// uninitialized region for direct writes, or `None` when the sink
+    /// cannot offer one (the streaming formatter keeps a fixed-size
+    /// buffer).
+    fn reserve_spare(&mut self, additional: usize) -> Option<&mut [MaybeUninit<u8>]> {
+        let _ = additional;
+        None
+    }
+
+    /// Commit `len` bytes written into the region returned by the last
+    /// successful [`Sink::reserve_spare`].
+    ///
+    /// # Safety
+    ///
+    /// Call only right after a successful `reserve_spare`, with at least
+    /// `len` bytes of its region initialized.
+    unsafe fn commit_spare(&mut self, len: usize) {
+        let _ = len;
+    }
 }
 
 impl Sink for Vec<u8> {
@@ -68,6 +99,19 @@ impl Sink for Vec<u8> {
     fn extend(&mut self, bytes: &[u8]) {
         self.extend_from_slice(bytes);
     }
+
+    #[inline]
+    fn reserve_spare(&mut self, additional: usize) -> Option<&mut [MaybeUninit<u8>]> {
+        self.reserve(additional);
+        Some(&mut self.spare_capacity_mut()[..additional])
+    }
+
+    #[inline]
+    unsafe fn commit_spare(&mut self, len: usize) {
+        // SAFETY: the caller initialized `len` bytes of the region reserved
+        // right before, which the Vec allocation holds.
+        unsafe { self.set_len(self.len() + len) };
+    }
 }
 
 impl<S: Sink + ?Sized> Sink for &mut S {
@@ -79,6 +123,17 @@ impl<S: Sink + ?Sized> Sink for &mut S {
     #[inline]
     fn extend(&mut self, bytes: &[u8]) {
         (**self).extend(bytes);
+    }
+
+    #[inline]
+    fn reserve_spare(&mut self, additional: usize) -> Option<&mut [MaybeUninit<u8>]> {
+        (**self).reserve_spare(additional)
+    }
+
+    #[inline]
+    unsafe fn commit_spare(&mut self, len: usize) {
+        // SAFETY: forwarded with the same contract.
+        unsafe { (**self).commit_spare(len) };
     }
 }
 
@@ -238,8 +293,33 @@ impl<W: Sink> Writer<W> {
     }
 
     fn write_escaped(&mut self, s: &str) {
-        self.out.push(b'"');
         let bytes = s.as_bytes();
+        // Clean strings copy as one slice, skipping the sizing scan and
+        // the word-wise direct write below.
+        if !needs_escape(bytes) {
+            self.out.push(b'"');
+            self.out.extend(bytes);
+            self.out.push(b'"');
+            return;
+        }
+        // Dirty strings take the direct-write path: one scan sizes the
+        // region exactly, then writes proceed straight into it with no
+        // per-byte capacity checks. Both `Option`s are checked so a string
+        // whose output length would overflow `usize` falls back to the
+        // append path below instead.
+        if let Some(need) = escaped_len(bytes)
+            && let Some(spare) = self.out.reserve_spare(need)
+        {
+            // SAFETY: `spare` holds exactly the output length of `bytes`.
+            let written = unsafe { escape_into(spare, bytes) };
+            // SAFETY: `escape_into` initialized exactly `written` bytes of
+            // the region reserved immediately before.
+            unsafe { self.out.commit_spare(written) };
+            return;
+        }
+        // Streaming sinks offer no spare region; escapes append through
+        // the checked push/extend path.
+        self.out.push(b'"');
         let mut start = 0;
         let mut i = 0;
         while i + 8 <= bytes.len() {
@@ -249,19 +329,153 @@ impl<W: Sink> Writer<W> {
             // test never trips mid-codepoint and words are safe to skip
             // across. A flagged word falls back to the byte-wise pass below.
             let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-            let dangerous = has_zero(w & 0xe0e0_e0e0_e0e0_e0e0)
-                | has_zero(w ^ 0x2222_2222_2222_2222)
-                | has_zero(w ^ 0x5c5c_5c5c_5c5c_5c5c);
-            if dangerous == 0 {
-                i += 8;
-            } else {
+            if dangerous_mask(w) != 0 {
                 start = escape_range(&mut self.out, bytes, i, i + 8, start);
-                i += 8;
             }
+            i += 8;
         }
         start = escape_range(&mut self.out, bytes, i, bytes.len(), start);
         self.out.extend(&bytes[start..]);
         self.out.push(b'"');
+    }
+}
+
+/// SWAR mask of whole words: nonzero when the word holds any byte in
+/// {< 0x20, `"` `\`}. UTF-8 continuation bytes are >= 0x80, so the < 0x20
+/// test never trips mid-codepoint.
+#[inline]
+fn dangerous_mask(word: u64) -> u64 {
+    has_zero(word & 0xe0e0_e0e0_e0e0_e0e0)
+        | has_zero(word ^ 0x2222_2222_2222_2222)
+        | has_zero(word ^ 0x5c5c_5c5c_5c5c_5c5c)
+}
+
+/// Whether `bytes` contains any byte the serializer escapes.
+fn needs_escape(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        if dangerous_mask(u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap())) != 0 {
+            return true;
+        }
+        i += 8;
+    }
+    bytes[i..].iter().any(|&b| ESCAPE[usize::from(b)] != 0)
+}
+
+/// Exact number of bytes [`escape_into`] writes for `bytes`, both quotes
+/// included, or `None` when the sum overflows `usize`. Whole clean words add
+/// their length through the same SWAR test [`needs_escape`] uses; flagged
+/// words and the tail pay the per-byte expansion table.
+fn escaped_len(bytes: &[u8]) -> Option<usize> {
+    let mut len = bytes.len().checked_add(2)?;
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        if dangerous_mask(u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap())) != 0 {
+            for &b in &bytes[i..i + 8] {
+                len = len.checked_add(ESCAPE_EXPANSION[usize::from(ESCAPE[usize::from(b)])])?;
+            }
+        }
+        i += 8;
+    }
+    for &b in &bytes[i..] {
+        len = len.checked_add(ESCAPE_EXPANSION[usize::from(ESCAPE[usize::from(b)])])?;
+    }
+    Some(len)
+}
+
+/// Escape `bytes` into the uninitialized region `dst` (both quotes
+/// included) and return the number of bytes written. Clean runs between
+/// escapes copy as one slice; only flagged words and the final partial word
+/// go byte-wise.
+///
+/// # Safety
+///
+/// `dst.len() >= escaped_len(bytes)`: the writes below produce exactly that
+/// many bytes, so none reaches past `dst`.
+unsafe fn escape_into(dst: &mut [MaybeUninit<u8>], bytes: &[u8]) -> usize {
+    debug_assert!(
+        dst.len() >= escaped_len(bytes).expect("the caller reserved the exact output size")
+    );
+    // SAFETY: every write is covered by the reserve bound above.
+    unsafe {
+        let base = dst.as_mut_ptr().cast::<u8>();
+        let mut w = base;
+        *w = b'"';
+        w = w.add(1);
+        let mut i = 0;
+        let mut start = 0;
+        while i + 8 <= bytes.len() {
+            let word = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+            if dangerous_mask(word) == 0 {
+                i += 8;
+            } else {
+                // `bytes[start..i]` holds only clean words (a flagged word
+                // always resets `start` past itself), so it copies raw.
+                w = put(w, &bytes[start..i]);
+                for &b in &bytes[i..i + 8] {
+                    w = escape_byte(w, b);
+                }
+                i += 8;
+                start = i;
+            }
+        }
+        // The remaining clean words, then the final partial word, which the
+        // word loop never checked and must classify byte-wise.
+        w = put(w, &bytes[start..i]);
+        for &b in &bytes[i..] {
+            w = escape_byte(w, b);
+        }
+        *w = b'"';
+        w = w.add(1);
+        w.addr() - base.addr()
+    }
+}
+
+/// Copy `bytes` to `w` and return the advanced pointer.
+///
+/// # Safety
+///
+/// `w` must point into a region with room for `bytes.len()` more bytes.
+#[inline]
+unsafe fn put(w: *mut u8, bytes: &[u8]) -> *mut u8 {
+    // SAFETY: the caller guarantees room for `bytes.len()` more bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), w, bytes.len());
+        w.add(bytes.len())
+    }
+}
+
+/// Escape one byte to `w` and return the advanced pointer.
+///
+/// # Safety
+///
+/// `w` must point into a region with room for the escape, at most 6 bytes
+/// (`\u00XX`).
+#[inline]
+unsafe fn escape_byte(mut w: *mut u8, byte: u8) -> *mut u8 {
+    // SAFETY: the caller guarantees room for the escape (at most 6 bytes).
+    unsafe {
+        let class = ESCAPE[usize::from(byte)];
+        if class == 0 {
+            *w = byte;
+            return w.add(1);
+        }
+        *w = b'\\';
+        w = w.add(1);
+        match class {
+            CLASS_UNICODE => {
+                *w = b'u';
+                *w.add(1) = b'0';
+                *w.add(2) = b'0';
+                *w.add(3) = HEX[usize::from(byte >> 4)];
+                *w.add(4) = HEX[usize::from(byte & 0x0f)];
+                w.add(5)
+            },
+            short => {
+                *w = SHORT_ESCAPES[usize::from(short)];
+                w.add(1)
+            },
+        }
     }
 }
 
@@ -295,7 +509,6 @@ fn escape_range<S: Sink + ?Sized>(
         out.push(b'\\');
         match class {
             CLASS_UNICODE => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
                 out.extend(b"u00");
                 out.push(HEX[usize::from(byte >> 4)]);
                 out.push(HEX[usize::from(byte & 0x0f)]);
@@ -1267,5 +1480,61 @@ mod serde_tests {
             matches!(error, crate::Error::Custom(ref message) if &**message == "binary data is not supported"),
             "unexpected error: {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ESCAPE, ESCAPE_EXPANSION, escaped_len, to_vec};
+    use crate::value::{Str, Value};
+
+    /// The expansion table must agree with the per-byte encoder for every
+    /// byte value and class.
+    #[test]
+    fn expansion_table_matches_escape_lengths() {
+        let mut buf = [0u8; 6];
+        for b in 0..=u8::MAX {
+            // SAFETY: `buf` holds the 6-byte maximum escape.
+            let written = unsafe { super::escape_byte(buf.as_mut_ptr(), b) };
+            let out_len = written.addr() - buf.as_ptr().addr();
+            assert_eq!(
+                out_len,
+                1 + ESCAPE_EXPANSION[usize::from(ESCAPE[usize::from(b)])],
+                "byte {b:#04x}"
+            );
+        }
+    }
+
+    /// The sizing scan must equal the serialized byte count exactly across
+    /// every escape class, word alignment and distribution, so the reserve
+    /// it drives can never be short (or padded).
+    #[test]
+    fn escaped_len_matches_serialized_output() {
+        let mut cases = vec![
+            String::new(),
+            String::from("plain"),
+            String::from("\"\\ \t\n\u{8}\u{c}\r"),
+            String::from("\u{0}\u{1}\u{1f}"),
+            // Every C0 control byte back to back.
+            (0u8..0x20).map(char::from).collect(),
+            String::from("é\"é\\é\u{7}é"),
+        ];
+        for n in 0..24 {
+            // Short and six-byte escapes at every alignment in and around
+            // the 8-byte SWAR words.
+            cases.push(format!("{}\"{}", "a".repeat(n), "b".repeat(16)));
+            cases.push(format!("{}\u{5}{}", "a".repeat(16), "b".repeat(n)));
+        }
+        // Extreme distributions: one escape in a long string, every byte a
+        // six-byte escape.
+        cases.push(format!("{}\"{}", "a".repeat(1 << 16), "b".repeat(1 << 16)));
+        cases.push("\u{1}".repeat(1 << 12));
+        for s in &cases {
+            assert_eq!(
+                escaped_len(s.as_bytes()),
+                Some(to_vec(&Value::Str(Str::Static(s))).len()),
+                "{s:?}"
+            );
+        }
     }
 }
