@@ -123,11 +123,11 @@ fn value_delivered(stack: &mut [Open]) {
 /// past the value's last byte. Escape grammar and token spelling are not
 /// validated here; the accessors validate whatever they return.
 ///
-/// `stack` is caller-owned scratch for the open-container walk; it is
-/// cleared on entry (including after an error return), so a caller that
-/// walks one member at a time reuses a single allocation.
-fn value_range(bytes: &[u8], from: usize, stack: &mut Vec<Open>) -> Result<(usize, usize)> {
-    stack.clear();
+/// This is the root walk of [`get`]: every value it accepts is structurally
+/// sound, which is what lets [`value_end`] skip the re-validation when the
+/// descent locates members inside it.
+fn value_range(bytes: &[u8], from: usize) -> Result<(usize, usize)> {
+    let mut stack: Vec<Open> = Vec::with_capacity(16);
     let mut i = skip_seps(bytes, from)?;
     let start = i;
     if i >= bytes.len() {
@@ -141,7 +141,7 @@ fn value_range(bytes: &[u8], from: usize, stack: &mut Vec<Open>) -> Result<(usiz
         let b = bytes[i];
         match b {
             b'{' | b'[' => {
-                check_value_position(stack, i)?;
+                check_value_position(&stack, i)?;
                 if stack.len() >= MAX_DEPTH {
                     return Err(Error::DepthLimitExceeded {
                         limit: MAX_DEPTH,
@@ -183,7 +183,7 @@ fn value_range(bytes: &[u8], from: usize, stack: &mut Vec<Open>) -> Result<(usiz
                 if stack.is_empty() {
                     return Ok((start, i));
                 }
-                value_delivered(stack);
+                value_delivered(&mut stack);
             },
             b',' => {
                 match stack.last_mut() {
@@ -228,7 +228,7 @@ fn value_range(bytes: &[u8], from: usize, stack: &mut Vec<Open>) -> Result<(usiz
                     })
                 );
                 if !is_key {
-                    check_value_position(stack, i)?;
+                    check_value_position(&stack, i)?;
                 }
                 let (end, _) = skip_string(bytes, i)?;
                 if is_key {
@@ -239,7 +239,7 @@ fn value_range(bytes: &[u8], from: usize, stack: &mut Vec<Open>) -> Result<(usiz
                     if stack.is_empty() {
                         return Ok((start, end));
                     }
-                    value_delivered(stack);
+                    value_delivered(&mut stack);
                 }
                 i = end;
             },
@@ -256,11 +256,11 @@ fn value_range(bytes: &[u8], from: usize, stack: &mut Vec<Open>) -> Result<(usiz
                     }
                     *state = ObjState::Colon;
                 } else {
-                    check_value_position(stack, i)?;
+                    check_value_position(&stack, i)?;
                     if stack.is_empty() {
                         return Ok((start, end));
                     }
-                    value_delivered(stack);
+                    value_delivered(&mut stack);
                 }
                 i = end;
             },
@@ -271,6 +271,55 @@ fn value_range(bytes: &[u8], from: usize, stack: &mut Vec<Open>) -> Result<(usiz
                 offset: bytes.len(),
             });
         }
+    }
+}
+
+/// End (exclusive) of the value starting at `from`, without structural
+/// re-validation: the [`value_range`] root walk already accepted the
+/// document, so its member-state and alphabet checks could only repeat.
+/// The scan still tracks nesting depth, string extents (escape-aware) and
+/// comments; escape grammar and token spelling stay unchecked, exactly like
+/// the walk. Unreachable-on-validated-input failures still surface as
+/// errors rather than panics.
+fn value_end(bytes: &[u8], from: usize) -> Result<usize> {
+    match bytes[from] {
+        b'{' | b'[' => {
+            // Closers always match their opener in validated input, so a
+            // depth count replaces a stack of open kinds.
+            let mut depth: usize = 1;
+            let mut i = from + 1;
+            loop {
+                i = skip_seps(bytes, i)?;
+                let Some(&b) = bytes.get(i) else {
+                    return Err(Error::UnexpectedEof {
+                        offset: bytes.len(),
+                    });
+                };
+                match b {
+                    b'{' | b'[' => {
+                        depth += 1;
+                        i += 1;
+                    },
+                    b'}' | b']' => {
+                        depth -= 1;
+                        i += 1;
+                        if depth == 0 {
+                            return Ok(i);
+                        }
+                    },
+                    b'"' | b'\'' => {
+                        i = skip_string(bytes, i)?.0;
+                    },
+                    // Separators pass through singly; token bytes
+                    // (non-ASCII included) run to their end. Every arm
+                    // advances `i`.
+                    b',' | b':' => i += 1,
+                    _ => i = token_end(bytes, i),
+                }
+            }
+        },
+        b'"' | b'\'' => Ok(skip_string(bytes, from)?.0),
+        _ => Ok(token_end(bytes, from)),
     }
 }
 
@@ -452,8 +501,7 @@ impl core::fmt::Display for LazyValue<'_> {
 /// ```
 pub fn get<'a>(src: &'a str, path: &[&str]) -> Result<Option<LazyValue<'a>>> {
     let bytes = src.as_bytes();
-    let mut stack: Vec<Open> = Vec::with_capacity(16);
-    let (mut start, mut end) = value_range(bytes, 0, &mut stack)?;
+    let (mut start, mut end) = value_range(bytes, 0)?;
     let rest = skip_seps(bytes, end)?;
     if rest != bytes.len() {
         return Err(Error::TrailingCharacters { offset: rest });
@@ -468,7 +516,11 @@ pub fn get<'a>(src: &'a str, path: &[&str]) -> Result<Option<LazyValue<'a>>> {
     Ok(Some(LazyValue { bytes, start, end }))
 }
 
-/// Descend one path segment into the container at `(start, end)`.
+/// Descend one path segment into the container at `(start, end)`. The
+/// container sits inside a document the root walk validated, so member
+/// values are located by [`value_end`] without re-running the structural
+/// state machine; only the keys compared against `segment` are fully
+/// parsed.
 fn descend<'a>(
     bytes: &'a [u8],
     start: usize,
@@ -491,7 +543,9 @@ fn descend<'a>(
 /// Iterate the members of the object at `(start, end)` and return the
 /// range of the member matching `key` — the last match, mirroring the
 /// DOM's duplicate-key semantics. Keys are fully validated and unescaped
-/// (matching keys are grammar-checked, exactly like the DOM path).
+/// (matching keys are grammar-checked, exactly like the DOM path); member
+/// values are only located ([`value_end`]), their grammar left to the
+/// accessors.
 fn object_member(
     bytes: &[u8],
     start: usize,
@@ -500,7 +554,6 @@ fn object_member(
 ) -> Result<Option<(usize, usize)>> {
     let body_end = end - 1; // at the closing `}`
     let mut i = skip_seps(bytes, start + 1)?;
-    let mut stack: Vec<Open> = Vec::with_capacity(16);
     let mut found = None;
     while i < body_end {
         // The key: stage-2 parsing gives the exact DOM spelling semantics.
@@ -522,9 +575,9 @@ fn object_member(
             return Err(syntax("expected ':'", i));
         }
         i = skip_seps(bytes, i + 1)?;
-        let (vstart, vend) = value_range(bytes, i, &mut stack)?;
+        let vend = value_end(bytes, i)?;
         if key_str.as_str() == key {
-            found = Some((vstart, vend));
+            found = Some((i, vend));
         }
         i = skip_seps(bytes, vend)?;
         // Validated by the walk: `,` continues, `}` (possibly after a
@@ -538,7 +591,9 @@ fn object_member(
     Ok(found)
 }
 
-/// Locate the element at `index` of the array at `(start, end)`.
+/// Locate the element at `index` of the array at `(start, end)`. Elements
+/// are only located ([`value_end`]); their grammar is left to the
+/// accessors.
 fn array_element(
     bytes: &[u8],
     start: usize,
@@ -547,12 +602,11 @@ fn array_element(
 ) -> Result<Option<(usize, usize)>> {
     let body_end = end - 1; // at the closing `]`
     let mut i = skip_seps(bytes, start + 1)?;
-    let mut stack: Vec<Open> = Vec::with_capacity(16);
     let mut n = 0;
     while i < body_end {
-        let (vstart, vend) = value_range(bytes, i, &mut stack)?;
+        let vend = value_end(bytes, i)?;
         if n == index {
-            return Ok(Some((vstart, vend)));
+            return Ok(Some((i, vend)));
         }
         n += 1;
         i = skip_seps(bytes, vend)?;
@@ -840,5 +894,38 @@ mod tests {
         assert_eq!(get_ok(src, &["abc"]).unwrap().raw(), "1");
         assert_eq!(get_ok(src, &["plain"]).unwrap().raw(), "2");
         assert!(get_ok(src, &["a"]).is_none());
+    }
+
+    /// The method form of descent (`value.get("a")?.get("1")`) must agree
+    /// with the one-shot `get`: same located range, same misses, same key
+    /// grammar errors.
+    #[test]
+    fn method_get_matches_one_shot() {
+        let src = r"{ a: [1, { b: 2, }], c: 'x' }";
+        let root = get_ok(src, &[]).unwrap();
+        let via_methods = root
+            .get("a")
+            .unwrap()
+            .unwrap()
+            .get("1")
+            .unwrap()
+            .unwrap()
+            .get("b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(via_methods.raw(), "2");
+        assert_eq!(via_methods, get_ok(src, &["a", "1", "b"]).unwrap());
+        assert_eq!(via_methods.to_value().unwrap(), Value::U64(2));
+        // Misses stay misses: absent key, out-of-range index, a scalar
+        // segment on an array, an index on an object.
+        assert!(root.get("z").unwrap().is_none());
+        assert!(root.get("a").unwrap().unwrap().get("9").unwrap().is_none());
+        assert!(root.get("a").unwrap().unwrap().get("x").unwrap().is_none());
+        assert!(root.get("0").unwrap().is_none());
+        // Key grammar errors surface through the method form as well.
+        assert!(matches!(
+            get(r"{ 'a\x4': 1 }", &[]).unwrap().unwrap().get("z"),
+            Err(Error::InvalidEscape { offset: 4 })
+        ));
     }
 }

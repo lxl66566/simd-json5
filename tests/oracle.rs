@@ -62,6 +62,17 @@ fn check(json: &str) {
     number_variants(&ours, &mut ours_tags);
     number_variants(&expected, &mut expected_tags);
     assert_eq!(ours_tags, expected_tags, "number variants: {json}");
+    // The lazy walk covers the same document: its root walk plus the
+    // reparse behind to_value must reproduce the DOM exactly.
+    let lazy = simd_json5::get(json, &[])
+        .unwrap_or_else(|e| panic!("lazy walk rejected: {e}"))
+        .expect("the empty path always resolves")
+        .to_value()
+        .unwrap_or_else(|e| panic!("lazy reparse rejected: {e}"));
+    assert_eq!(lazy, ours, "lazy walk: {json}");
+    let mut lazy_tags = Vec::new();
+    number_variants(&lazy, &mut lazy_tags);
+    assert_eq!(lazy_tags, ours_tags, "lazy number variants: {json}");
 }
 
 #[test]
