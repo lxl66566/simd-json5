@@ -645,6 +645,10 @@ fn bytes_accept_string_form() {
     // `CString` is the standard type requesting `deserialize_byte_buf`.
     let c: std::ffi::CString = de::from_str(r#""ab""#).unwrap();
     assert_eq!(c.to_bytes(), b"ab");
+    // Escaped content unescapes into the owned buffer the visitor receives
+    // through `visit_byte_buf`.
+    let c: std::ffi::CString = de::from_str(r#""a\tb\x63""#).unwrap();
+    assert_eq!(c.to_bytes(), b"a\tbc");
     assert_eq!(
         serde_json::from_str::<std::ffi::CString>(r#""ab""#)
             .unwrap()

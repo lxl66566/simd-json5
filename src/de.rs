@@ -266,9 +266,11 @@ impl<'a, 'de> Deserializer<'a, 'de> {
 
     /// Parse a value for a bytes-expecting method. Like serde_json, a string
     /// is accepted: its (unescaped) bytes reach the visitor through
-    /// `visit_borrowed_bytes`/`visit_bytes`; anything else goes through the
-    /// seq path, so arrays of numbers still work and other inputs produce
-    /// serde's type errors.
+    /// `visit_borrowed_bytes` (escape-free) or `visit_byte_buf` (escaped,
+    /// moving the unescaped buffer; the serde default forwards to
+    /// `visit_bytes`, so slice-expecting visitors are unaffected); anything
+    /// else goes through the seq path, so arrays of numbers still work and
+    /// other inputs produce serde's type errors.
     fn parse_bytes<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
         match self.peek_byte() {
             Some(b'"' | b'\'') => {
@@ -277,7 +279,9 @@ impl<'a, 'de> Deserializer<'a, 'de> {
                 self.bump();
                 match s {
                     Str::Static(s) => visitor.visit_borrowed_bytes(s.as_bytes()),
-                    Str::Dynamic(s) => visitor.visit_bytes(s.as_bytes()),
+                    // Move the unescaped buffer instead of handing out a
+                    // slice byte-buf visitors would copy again.
+                    Str::Dynamic(s) => visitor.visit_byte_buf(s.into_bytes()),
                 }
             },
             _ => self.parse_seq(visitor),
