@@ -1,6 +1,6 @@
 [package]
 name         = "simd-json5"
-version      = "0.3.0"
+version      = "0.3.1"
 edition      = "2024"
 rust-version = "1.89"
 description  = "SIMD-accelerated JSON5 parser and serializer with serde support"
@@ -8,7 +8,11 @@ repository   = "https://github.com/lxl66566/simd-json5"
 license      = "MIT OR Apache-2.0"
 keywords     = ["json", "json5", "parser", "serde", "simd"]
 categories   = ["encoding", "parser-implementations"]
-include      = ["/LICENSE-*", "/README.md", "/benches/*.rs", "/examples/**", "/src/**", "/tests/**"]
+include      = ["/LICENSE-*", "/README.md", "/examples/**", "/src/**", "/tests/**"]
+
+[[example]]
+name              = "typed"
+required-features = ["serde"]
 
 [[bench]]
 harness = false
@@ -17,10 +21,6 @@ name    = "parse"
 [[bench]]
 harness = false
 name    = "serialize"
-
-[[example]]
-name              = "typed"
-required-features = ["serde"]
 
 [dependencies]
 fast-float2   = "0.2"
@@ -67,5 +67,5 @@ debug         = 1
 codegen-units = 1
 
 [profile.release]
+lto           = "thin"
 codegen-units = 1
-lto = "thin"

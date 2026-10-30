@@ -20,7 +20,9 @@
 //! let value = simd_json5::from_str("{ a: 1, // comment\n  b: [2, 3,] }").unwrap();
 //! assert_eq!(value["b"][0], simd_json5::Value::U64(2));
 //!
-//! let b = simd_json5::get("{ a: 1, b: [2, 3,] }", &["b", "1"]).unwrap().unwrap();
+//! let b = simd_json5::get("{ a: 1, b: [2, 3,] }", &["b", "1"])
+//!     .unwrap()
+//!     .unwrap();
 //! assert_eq!(b.as_i64().unwrap(), Some(3));
 //! ```
 
