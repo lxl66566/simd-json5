@@ -527,6 +527,11 @@ fn escape_range<S: Sink + ?Sized>(
     start
 }
 
+/// Chunk size the streaming sink hands to the formatter: 1 KiB keeps the
+/// sink's stack frame around a kilobyte (the walk it serves is iterative)
+/// while quartering the formatter-call rate of a 256-byte buffer.
+const STREAM_CHUNK: usize = 1024;
+
 /// Streaming sink for the `Display` impl: forwards serializer output to a
 /// formatter in fixed-size chunks instead of materializing the whole
 /// document. Chunks may split a multi-byte sequence; `flush` hands only
@@ -535,7 +540,7 @@ fn escape_range<S: Sink + ?Sized>(
 /// boundaries land between code points.
 pub(crate) struct FormatterSink<'f, 'a> {
     f: &'f mut core::fmt::Formatter<'a>,
-    buf: [u8; 256],
+    buf: [u8; STREAM_CHUNK],
     len: usize,
     failed: bool,
 }
@@ -583,7 +588,7 @@ impl<'f, 'a> FormatterSink<'f, 'a> {
     pub(crate) fn new(f: &'f mut core::fmt::Formatter<'a>) -> Self {
         Self {
             f,
-            buf: [0; 256],
+            buf: [0; STREAM_CHUNK],
             len: 0,
             failed: false,
         }

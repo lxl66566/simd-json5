@@ -179,8 +179,9 @@ fn display_matches_to_string() {
 /// formatter correctly.
 #[test]
 fn display_streams_long_multibyte_output() {
-    // Leading ASCII byte misaligns the chunks so boundaries fall mid-é.
-    let value = Value::Str(Str::Dynamic(format!("x{}", "é".repeat(300))));
+    // Leading ASCII byte misaligns the chunks so boundaries fall mid-é; the
+    // output spans several chunk boundaries.
+    let value = Value::Str(Str::Dynamic(format!("x{}", "é".repeat(2000))));
     assert_eq!(format!("{value}"), to_string(&value));
 }
 
@@ -207,28 +208,30 @@ impl std::fmt::Write for FailingWrite {
 ///
 /// - `array`: 1-byte extends alternating with pushes; the failing flush sits inside an `extend`,
 ///   and every later `push` must take the failed early return instead of indexing the full buffer.
-/// - `string`: a single 1200-byte `extend` spanning several flushes, so the failure lands mid-chunk
+/// - `string`: a single large `extend` spanning several flushes, so the failure lands mid-chunk
 ///   with bytes still left in it (a zero-progress loop would hang).
-/// - `panic path`: the output fills the buffer to exactly 256 bytes through pushes alone, so the
-///   next `push` flushes at entry; a failure there used to fall through to `buf[256]`.
+/// - `panic path`: the output fills the buffer to exactly the chunk size through pushes alone, so
+///   the next `push` flushes at entry; a failure there used to index past the buffer end.
 #[test]
 fn display_survives_formatter_failure() {
-    let array = Value::Array(vec![Value::I64(1); 600]);
-    assert!(to_string(&array).len() > 256);
-    let string = Value::Str(Str::Dynamic("x".repeat(1200)));
-    // `[` plus the first member's `"xxx…x"` is exactly 256 bytes, so the `,`
+    // Matches the FormatterSink chunk size in src/ser.rs.
+    const CHUNK: usize = 1024;
+    let array = Value::Array(vec![Value::I64(1); 4 * CHUNK]);
+    assert!(to_string(&array).len() > 4 * CHUNK);
+    let string = Value::Str(Str::Dynamic("x".repeat(6 * CHUNK)));
+    // `[` plus the first member's `"xxx…x"` is exactly CHUNK bytes, so the `,`
     // push after it flushes at entry. The tail members only pad the document
-    // past four 256-byte flushes so every budget in 0..4 fails.
+    // past four chunk flushes so every budget in 0..4 fails.
     let panic_path = Value::Array(
         [
-            Value::Str(Str::Dynamic("x".repeat(253))),
+            Value::Str(Str::Dynamic("x".repeat(CHUNK - 3))),
             Value::Str(Str::Static("")),
         ]
         .into_iter()
-        .chain((0..600).map(Value::I64))
+        .chain((0..2400).map(Value::I64))
         .collect(),
     );
-    assert!(to_string(&panic_path).len() > 1024);
+    assert!(to_string(&panic_path).len() > 4 * CHUNK);
     for (label, value) in [
         ("array", &array),
         ("string", &string),
