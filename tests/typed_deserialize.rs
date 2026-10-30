@@ -73,7 +73,8 @@ impl<'de> Deserialize<'de> for F64Key {
     }
 }
 
-/// The f32 flavor, exercising `deserialize_f32`'s forward to the f64 method.
+/// The f32 flavor: `deserialize_f32` parses the key text at f32 precision
+/// directly, so the value arrives through `visit_f32`.
 #[derive(PartialEq, Debug)]
 struct F32Key(f32);
 
@@ -98,11 +99,8 @@ impl<'de> Deserialize<'de> for F32Key {
                 f.write_str("a float map key")
             }
 
-            // The value arrives as f64 (`deserialize_f32` forwards there)
-            // and narrows back.
-            #[allow(clippy::cast_possible_truncation)]
-            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
-                Ok(F32Key(v as f32))
+            fn visit_f32<E>(self, v: f32) -> Result<Self::Value, E> {
+                Ok(F32Key(v))
             }
         }
         deserializer.deserialize_f32(V)
@@ -564,6 +562,37 @@ fn wide_integer_targets() {
     }
 }
 
+/// f32 targets evaluate document numbers at f32 precision in a single
+/// rounding, not through an f64 round trip.
+#[test]
+fn f32_targets_evaluate_at_f32_precision() {
+    assert_eq!(de::from_str::<f32>("1.5").unwrap(), 1.5);
+    assert_eq!(de::from_str::<f32>(".5").unwrap(), 0.5);
+    assert_eq!(de::from_str::<f32>("1.e3").unwrap(), 1000.0);
+    assert_eq!(de::from_str::<f32>("0x10").unwrap(), 16.0);
+    assert_eq!(
+        de::from_str::<f32>("18446744073709551616").unwrap(),
+        1.844_674_4e19
+    );
+    assert_eq!(de::from_str::<f32>("Infinity").unwrap(), f32::INFINITY);
+    assert_eq!(de::from_str::<f32>("-Infinity").unwrap(), f32::NEG_INFINITY);
+    assert!(de::from_str::<f32>("NaN").unwrap().is_nan());
+    // The double-rounding boundary: see the number.rs test of the same name.
+    assert_eq!(
+        de::from_str::<f32>("1.0000000596046448").unwrap(),
+        1.000_000_1
+    );
+    assert_eq!(
+        de::from_str::<Vec<f32>>("[1.0000000596046448, 1.0]").unwrap(),
+        vec![1.000_000_1, 1.0]
+    );
+    // Non-number inputs keep the f64 method's type errors.
+    let err = de::from_str::<f32>("'x'").unwrap_err();
+    assert!(
+        matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type: string"))
+    );
+}
+
 /// Number grammar errors keep their variant and byte offset on the typed
 /// walk, both at the root and inside containers.
 #[test]
@@ -721,10 +750,14 @@ fn map_key_bool_and_number_branches() {
         &u128::MAX,
     );
     // Float keys through the wrapper types, including f64::MAX's decimal
-    // form and the f32 forward.
+    // form and the f32 direct parse.
     assert_single_key::<F64Key>(r#"{ "1.5e3": 1 }"#, &F64Key(1500.0));
     assert_single_key::<F64Key>(r#"{ "1.7976931348623157e308": 1 }"#, &F64Key(f64::MAX));
     assert_single_key::<F32Key>(r#"{ "2.5": 1 }"#, &F32Key(2.5));
+    // The f32 key parse rounds once: this decimal sits just above the f32
+    // midpoint 1 + 2^-24, so direct f32 rounds up while an f64 round trip
+    // would tie to even (1.0).
+    assert_single_key::<F32Key>(r#"{ "1.0000000596046448": 1 }"#, &F32Key(1.000_000_1));
 
     // FromStr accepts a leading `+` for integers too, and the float
     // spellings `Infinity`/`NaN`; serde_json's numeric keys reject all of
@@ -747,6 +780,9 @@ fn map_key_bool_and_number_branches() {
     bad_key!(i64, "expected i64", r#"{ "Infinity": 1 }"#);
     bad_key!(F64Key, "expected f64", r#"{ "0x10": 1 }"#);
     bad_key!(F64Key, "expected f64", r#"{ "abc": 1 }"#);
+    // The f32 key error names f32, not f64.
+    bad_key!(F32Key, "expected f32", r#"{ "0x10": 1 }"#);
+    bad_key!(F32Key, "expected f32", r#"{ "abc": 1 }"#);
     bad_key!(
         i128,
         "expected i128",

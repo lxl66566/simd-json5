@@ -11,10 +11,11 @@
 //! a correctly rounded conversion by 1 ULP. Inputs that large are out of
 //! scope.
 //!
-//! The serde i128/u128 visitors get a dedicated entry: [`parse_num_wide`]
-//! keeps 128-bit integer literals exact (rejecting those past the 128-bit
-//! range). The DOM and `deserialize_any` paths use [`parse_num`]/[`Num`]
-//! unchanged.
+//! The serde i128/u128 and f32 visitors get dedicated entries:
+//! [`parse_num_wide`] keeps 128-bit integer literals exact (rejecting those
+//! past the 128-bit range) and [`parse_num_f32`] evaluates floats at f32
+//! precision in a single rounding. The DOM and `deserialize_any` paths use
+//! [`parse_num`]/[`Num`] unchanged.
 
 use crate::{Error, Result, value::Value};
 
@@ -48,6 +49,16 @@ pub(crate) enum Num128 {
     I128(i128),
     U128(u128),
     F64(f64),
+}
+
+/// A parsed number for the serde f32 visitor: the integer hints of [`Num`]
+/// with float values evaluated directly at f32 precision.
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum NumF32 {
+    I64(i64),
+    U64(u64),
+    F32(f32),
 }
 
 /// First bytes a number token may start with: exactly the byte set
@@ -148,6 +159,32 @@ pub(crate) fn parse_num_wide(token: &[u8], offset: usize) -> Result<Num128> {
         Num::U64(u) => Num128::U128(u128::from(u)),
         Num::F64(f) => Num128::F64(f),
     })
+}
+
+/// Parse a bare number token for the serde f32 visitor. Integer hints match
+/// [`parse_num`]; float spellings are evaluated directly at f32 precision —
+/// one decimal rounding, instead of the decimal→f64→f32 double rounding the
+/// f64 delegation performs (they differ by 1 ULP on f32 tie boundaries).
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
+pub(crate) fn parse_num_f32(token: &[u8], offset: usize) -> Result<NumF32> {
+    Ok(match parse_num(token, offset)? {
+        Num::I64(i) => NumF32::I64(i),
+        Num::U64(u) => NumF32::U64(u),
+        Num::F64(f) => NumF32::F32(f32_value(token, f)),
+    })
+}
+
+/// Direct f32 evaluation of a grammar-validated token whose [`parse_num`]
+/// value is `f64_value`. fast_float2 accepts every decimal spelling of the
+/// grammar (elided forms, signs, the `Infinity`/`NaN` keywords); only hex
+/// literals overflow into `Num::F64`, and those narrow their f64 value —
+/// hex has no decimal spelling to re-round.
+#[allow(
+    clippy::cast_precision_loss, // f64 -> f32 narrowing is the intent for hex overflow
+    clippy::cast_possible_truncation
+)]
+fn f32_value(token: &[u8], f64_value: f64) -> f32 {
+    fast_float2::parse::<f32, _>(token).unwrap_or(f64_value as f32)
 }
 
 /// DOM entry: the grammar in [`parse_num`] mapped onto [`Value`] variants.
@@ -971,6 +1008,37 @@ mod tests {
         ] {
             assert_eq!(
                 parse_num_wide(t.as_bytes(), 0).unwrap_err(),
+                parse_num(t.as_bytes(), 0).unwrap_err(),
+                "token {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f32_entry_single_rounding() {
+        let f32n = |t: &str| parse_num_f32(t.as_bytes(), 0).unwrap();
+        assert_eq!(f32n("42"), NumF32::U64(42));
+        assert_eq!(f32n("-7"), NumF32::I64(-7));
+        assert_eq!(f32n("0x10"), NumF32::U64(16));
+        assert_eq!(f32n("1.5"), NumF32::F32(1.5));
+        assert_eq!(f32n(".5"), NumF32::F32(0.5));
+        assert_eq!(f32n("5."), NumF32::F32(5.0));
+        assert_eq!(f32n("1.e3"), NumF32::F32(1000.0));
+        assert_eq!(f32n("1e3"), NumF32::F32(1000.0));
+        assert_eq!(f32n("Infinity"), NumF32::F32(f32::INFINITY));
+        assert_eq!(f32n("-Infinity"), NumF32::F32(f32::NEG_INFINITY));
+        assert!(matches!(f32n("NaN"), NumF32::F32(v) if v.is_nan()));
+        // This decimal sits just above the f32 midpoint 1 + 2^-24: the direct
+        // f32 rounding rounds up, while decimal -> f64 -> f32 lands on the
+        // exact midpoint and ties to even (1.0).
+        assert_eq!(f32n("1.0000000596046448"), NumF32::F32(1.000_000_1_f32));
+        // Hex past the 64-bit variants has no decimal spelling; its f64
+        // value (2^65 after the u128 rounding) narrows.
+        assert_eq!(f32n("0x1FFFFFFFFFFFFFFFF"), NumF32::F32(3.689_349e19_f32));
+        // Grammar errors are parse_num's.
+        for t in ["", "1a", "0x", "1.2.3", ".e3"] {
+            assert_eq!(
+                parse_num_f32(t.as_bytes(), 0).unwrap_err(),
                 parse_num(t.as_bytes(), 0).unwrap_err(),
                 "token {t:?}"
             );

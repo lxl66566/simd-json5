@@ -33,7 +33,7 @@ use crate::{
     Error, Result,
     parser::{
         Counts, container_counts, initial_index_capacity,
-        number::{self, Num, Num128},
+        number::{self, Num, Num128, NumF32},
         simd,
         stage1::{CLASSES, Span, class, token_end},
         stage2,
@@ -1441,7 +1441,16 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
     where
         V: Visitor<'de>,
     {
-        self.deserialize_f64(visitor)
+        match self.try_current_num_with(number::parse_num_f32) {
+            Some(Ok(NumF32::U64(u))) => visitor.visit_u64(u),
+            Some(Ok(NumF32::I64(i))) => visitor.visit_i64(i),
+            // One decimal rounding, not the f64 double rounding.
+            Some(Ok(NumF32::F32(v))) => visitor.visit_f32(v),
+            Some(Err(e)) => Err(e),
+            // Non-number entries (keywords, strings, containers) share the
+            // f64 method's type errors and value mapping.
+            None => self.deserialize_f64(visitor),
+        }
     }
 
     fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
@@ -1893,6 +1902,20 @@ mod tests {
         let err = from_str::<u128>("1.5").unwrap_err();
         assert!(
             matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type: floating point"))
+        );
+    }
+
+    /// f32 targets evaluate document numbers at f32 precision in a single
+    /// rounding.
+    #[test]
+    fn f32_targets_single_rounding() {
+        assert_eq!(from_str::<f32>("1.5").unwrap(), 1.5);
+        assert_eq!(from_str::<f32>("0x10").unwrap(), 16.0);
+        assert_eq!(from_str::<f32>("Infinity").unwrap(), f32::INFINITY);
+        // The double-rounding boundary: see the number.rs test of the same name.
+        assert_eq!(
+            from_str::<f32>("1.0000000596046448").unwrap(),
+            1.000_000_1_f32
         );
     }
 
