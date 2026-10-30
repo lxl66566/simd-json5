@@ -18,6 +18,10 @@ name    = "parse"
 harness = false
 name    = "serialize"
 
+[[example]]
+name              = "typed"
+required-features = ["serde"]
+
 [dependencies]
 fast-float2   = "0.2"
 fearless_simd = "1.2"
