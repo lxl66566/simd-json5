@@ -175,7 +175,8 @@ impl<W: Sink> Writer<W> {
         self.out.push(b'[');
         let mut first = true;
         for item in items {
-            self.before_item(&mut first);
+            self.before_item(first);
+            first = false;
             self.write_value(item);
         }
         self.after_items(first, b']');
@@ -185,7 +186,8 @@ impl<W: Sink> Writer<W> {
         self.out.push(b'{');
         let mut first = true;
         for (key, item) in members {
-            self.before_item(&mut first);
+            self.before_item(first);
+            first = false;
             self.write_escaped(key.as_str());
             self.write_key_value_separator();
             self.write_value(item);
@@ -196,9 +198,10 @@ impl<W: Sink> Writer<W> {
     /// Emit the separator before a container item. The first item opens the
     /// indent level (pretty mode); later items get a comma. Shared by the DOM
     /// writer and the serde serializer so both produce identical bytes.
-    fn before_item(&mut self, first: &mut bool) {
-        if *first {
-            *first = false;
+    /// Callers track firstness themselves (`first` is true until the first
+    /// item is written).
+    fn before_item(&mut self, first: bool) {
+        if first {
             self.indent += 1;
         } else {
             self.out.push(b',');
@@ -969,7 +972,7 @@ pub(crate) mod serde_impls {
         fn map_compound(self, variant: bool) -> MapCompound<'w> {
             MapCompound {
                 writer: self.writer,
-                first: true,
+                state: MapState::First,
                 variant,
             }
         }
@@ -991,7 +994,8 @@ pub(crate) mod serde_impls {
         where
             T: ?Sized + Serialize,
         {
-            self.writer.before_item(&mut self.first);
+            self.writer.before_item(self.first);
+            self.first = false;
             value.serialize(Serializer {
                 writer: self.writer,
             })
@@ -1061,11 +1065,26 @@ pub(crate) mod serde_impls {
         }
     }
 
+    /// SerializeMap protocol state: keys and values must strictly alternate.
+    /// Hand-written `Serialize` impls can break the alternation (two keys in
+    /// a row, a value without a key, ending on a bare key); these are
+    /// rejected instead of silently producing malformed JSON5 such as
+    /// `{"a"1}` or `{"a":1:2}`. Derived impls always alternate.
+    #[derive(Clone, Copy)]
+    enum MapState {
+        /// No entry written yet; the container is still empty.
+        First,
+        /// A key was written and awaits its value.
+        KeyWritten,
+        /// The key's value was written; the entry is complete.
+        ValueWritten,
+    }
+
     /// Object-like containers: maps, structs and (with `variant`) externally
     /// tagged struct variants.
     pub(crate) struct MapCompound<'w> {
         writer: &'w mut Writer,
-        first: bool,
+        state: MapState,
         variant: bool,
     }
 
@@ -1077,26 +1096,33 @@ pub(crate) mod serde_impls {
         where
             T: ?Sized + Serialize,
         {
-            self.writer.before_item(&mut self.first);
+            self.begin_entry()?;
             key.serialize(KeySerializer {
                 writer: self.writer,
-            })
+            })?;
+            self.state = MapState::KeyWritten;
+            Ok(())
         }
 
         fn serialize_value<T>(&mut self, value: &T) -> Result<()>
         where
             T: ?Sized + Serialize,
         {
+            if !matches!(self.state, MapState::KeyWritten) {
+                return Err(Error::custom(
+                    "serialize_value called without serialize_key",
+                ));
+            }
             self.writer.write_key_value_separator();
             value.serialize(Serializer {
                 writer: self.writer,
-            })
+            })?;
+            self.state = MapState::ValueWritten;
+            Ok(())
         }
 
         fn end(self) -> Result<()> {
-            self.writer.after_items(self.first, b'}');
-            self.close_variant();
-            Ok(())
+            self.close()
         }
     }
 
@@ -1108,18 +1134,18 @@ pub(crate) mod serde_impls {
         where
             T: ?Sized + Serialize,
         {
-            self.writer.before_item(&mut self.first);
+            self.begin_entry()?;
             self.writer.write_escaped(key);
             self.writer.write_key_value_separator();
             value.serialize(Serializer {
                 writer: self.writer,
-            })
+            })?;
+            self.state = MapState::ValueWritten;
+            Ok(())
         }
 
         fn end(self) -> Result<()> {
-            self.writer.after_items(self.first, b'}');
-            self.close_variant();
-            Ok(())
+            self.close()
         }
     }
 
@@ -1140,6 +1166,40 @@ pub(crate) mod serde_impls {
     }
 
     impl MapCompound<'_> {
+        /// Emit the separator before an entry's key: the first entry opens
+        /// the indent level, later entries get a comma. A key written while
+        /// the previous key still awaits its value breaks the alternation and
+        /// is rejected.
+        fn begin_entry(&mut self) -> Result<()> {
+            match self.state {
+                MapState::KeyWritten => Err(Error::custom(
+                    "serialize_key called twice before serialize_value",
+                )),
+                state => {
+                    self.writer.before_item(matches!(state, MapState::First));
+                    Ok(())
+                },
+            }
+        }
+
+        /// Close the container. An entry whose key never got its value is
+        /// rejected; an empty container closes inline (pretty mode emits no
+        /// newline inside it).
+        fn close(self) -> Result<()> {
+            match self.state {
+                MapState::KeyWritten => {
+                    Err(Error::custom("map ended with a key missing its value"))
+                },
+                state => {
+                    self.writer
+                        .after_items(matches!(state, MapState::First), b'}');
+                    self.close_variant();
+                    Ok(())
+                },
+            }
+        }
+
+        /// Close the `{"name":` wrapper opened by `begin_variant`.
         fn close_variant(self) {
             if self.variant {
                 self.writer.end_variant();
@@ -1468,6 +1528,116 @@ mod serde_tests {
             matches!(error, crate::Error::Custom(ref message) if &**message == "map keys must be strings"),
             "unexpected error: {error:?}"
         );
+    }
+
+    /// Hand-written `Serialize` impls can break the SerializeMap key→value
+    /// alternation; every violation pattern must surface an error instead of
+    /// silently producing malformed JSON5 such as `{"a"1}` or `{"a":1:2}`.
+    /// Derived impls and correct hand-written alternation are unaffected.
+    #[test]
+    fn map_protocol_violations_rejected() {
+        use serde::ser::SerializeMap as _;
+
+        enum Violation {
+            KeyAfterKey,
+            ValueWithoutKey,
+            ValueAfterValue,
+            DanglingKey,
+        }
+
+        impl Serialize for Violation {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let mut map = serializer.serialize_map(None)?;
+                match self {
+                    // Every violating call returns early through `?` (or is
+                    // `end` itself), so the trailing `end()` is reached only
+                    // if the serializer wrongly accepted the violation.
+                    Self::KeyAfterKey => {
+                        map.serialize_key("a")?;
+                        map.serialize_key("b")?;
+                        map.end()
+                    },
+                    Self::ValueWithoutKey => {
+                        map.serialize_value(&1)?;
+                        map.end()
+                    },
+                    Self::ValueAfterValue => {
+                        map.serialize_key("a")?;
+                        map.serialize_value(&1)?;
+                        map.serialize_value(&2)?;
+                        map.end()
+                    },
+                    Self::DanglingKey => {
+                        map.serialize_key("a")?;
+                        map.end()
+                    },
+                }
+            }
+        }
+
+        // Correct hand-written alternation still passes in both layouts,
+        // mixing serialize_entry with the key/value pair.
+        struct WellFormed;
+        impl Serialize for WellFormed {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("a", &1)?;
+                map.serialize_key("b")?;
+                map.serialize_value(&vec![2])?;
+                map.end()
+            }
+        }
+
+        // An empty map closes in the first protocol state.
+        struct EmptyMap;
+        impl Serialize for EmptyMap {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_map(Some(0))?.end()
+            }
+        }
+
+        let cases = [
+            (
+                Violation::KeyAfterKey,
+                "serialize_key called twice before serialize_value",
+            ),
+            (
+                Violation::ValueWithoutKey,
+                "serialize_value called without serialize_key",
+            ),
+            (
+                Violation::ValueAfterValue,
+                "serialize_value called without serialize_key",
+            ),
+            (
+                Violation::DanglingKey,
+                "map ended with a key missing its value",
+            ),
+        ];
+        for (value, expected) in cases {
+            let error = to_bytes(&value, false).unwrap_err();
+            assert!(
+                matches!(error, crate::Error::Custom(ref message) if &**message == expected),
+                "{expected}: unexpected error: {error:?}"
+            );
+        }
+
+        assert_eq!(compact(&WellFormed), r#"{"a":1,"b":[2]}"#);
+        assert_eq!(
+            pretty(&WellFormed),
+            "{\n  \"a\": 1,\n  \"b\": [\n    2\n  ]\n}"
+        );
+        assert_eq!(compact(&EmptyMap), "{}");
+        assert_eq!(pretty(&EmptyMap), "{}");
     }
 
     #[test]
