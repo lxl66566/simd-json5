@@ -330,12 +330,12 @@ fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Num> {
         let elided_frac = had_dot && frac_digits == 0;
         return Ok(Num::F64(signed(
             neg,
-            float_value(s, leading_dot, elided_frac),
+            float_value(s, leading_dot, elided_frac, offset)?,
         )));
     }
     // Pure integer: keep the integer variant while the magnitude fits.
     if overflow {
-        let f = lib_parse(s);
+        let f = lib_parse(s, offset)?;
         return Ok(Num::F64(signed(neg, f)));
     }
     if !neg {
@@ -347,7 +347,7 @@ fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Num> {
     if acc <= (i64::MAX as u64) + 1 {
         return Ok(Num::I64((acc as i64).wrapping_neg()));
     }
-    let f = lib_parse(s);
+    let f = lib_parse(s, offset)?;
     Ok(Num::F64(signed(neg, f)))
 }
 
@@ -390,10 +390,11 @@ fn pow10_fast(significant: u64, exp: i64) -> f64 {
 /// marks `.5` forms and `elided_frac` marks `5.` / `1.e3` forms; both are
 /// normalized (to `0.5` / `5.0`) because C `from_chars` semantics are not
 /// guaranteed for elided digit runs by every backend. Both flags come from
-/// the grammar pass, so no byte is scanned twice.
-fn float_value(s: &[u8], leading_dot: bool, elided_frac: bool) -> f64 {
+/// the grammar pass, so no byte is scanned twice. A parse failure of both
+/// float backends surfaces as `Error::InvalidNumber` at `offset`.
+fn float_value(s: &[u8], leading_dot: bool, elided_frac: bool, offset: usize) -> Result<f64> {
     if !leading_dot && !elided_frac {
-        return lib_parse(s);
+        return lib_parse(s, offset);
     }
     // The normalized form inserts one byte (`0`); at most one of the two
     // flags can be set (`.` alone is rejected by the grammar). Legal tokens
@@ -420,7 +421,7 @@ fn float_value(s: &[u8], leading_dot: bool, elided_frac: bool) -> f64 {
             buf[n..n + s.len()].copy_from_slice(s);
             n += s.len();
         }
-        lib_parse(&buf[..n])
+        lib_parse(&buf[..n], offset)
     } else {
         let mut buf = Vec::with_capacity(s.len() + 1);
         if leading_dot {
@@ -434,20 +435,21 @@ fn float_value(s: &[u8], leading_dot: bool, elided_frac: bool) -> f64 {
         } else {
             buf.extend_from_slice(s);
         }
-        lib_parse(&buf)
+        lib_parse(&buf, offset)
     }
 }
 
-fn lib_parse(s: &[u8]) -> f64 {
+fn lib_parse(s: &[u8], offset: usize) -> Result<f64> {
     if let Ok(f) = fast_float2::parse::<f64, _>(s) {
-        return f;
+        return Ok(f);
     }
-    // Unreachable for grammar-validated input (overflow reports Ok(inf));
-    // if ever hit, defer to std, which also maps underflow to 0.
+    // Unreachable for grammar-validated input (overflow reports Ok(inf),
+    // underflow Ok(0)); the std layer is a second chance, and a failure of
+    // both is reported instead of silently corrupting the value.
     core::str::from_utf8(s)
         .ok()
         .and_then(|t| t.parse::<f64>().ok())
-        .unwrap_or(f64::INFINITY)
+        .ok_or_else(|| invalid_number(offset))
 }
 
 #[cfg(test)]
