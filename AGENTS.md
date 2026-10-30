@@ -13,3 +13,9 @@ Project policy for agents working in this repository:
 - Serializer map keys must be string-like: `str`, `char`, unit-variant names, and `Some(inner)` of a string-like value. `None` and other non-strings are rejected.
 - `SerializeMap` protocol violations (key without value, and similar) raise an error instead of emitting malformed JSON5.
 - `Value::Object` equality compares member sets and ignores insertion order; insertion order governs iteration and serialization only.
+
+## Benchmarking
+
+- Criterion wall deltas are dominated by per-build code-layout rolls: ±5-15% per cell, stable per source state, affecting even code a change never touched. Instruction counts are the deterministic truth. Attribute a regression with callgrind Ir per call on the criterion binaries (`valgrind --tool=callgrind <bench-bin> --bench --profile-time 2 '<cell>/simd-json5'`, inclusive Ir of the entry fn over its call count) before believing a wall delta; two independent `ab.py` runs for merge verdicts; discount single-run >4% outliers.
+- The release profile keeps `lto = "thin"`: fat LTO measured equal instruction counts with no wall gain and slower builds; no-LTO measured no gain either.
+- A stage-1 token-end table was measured and dropped: it trades string-heavy corpora for number-heavy ones (citm/twitter +3-8% Ir versus canada -5.5% Ir). A fused single-push (start, end) index is the design that could pay; see `perf/parser-core-orig`.
