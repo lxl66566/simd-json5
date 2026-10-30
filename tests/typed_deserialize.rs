@@ -709,9 +709,12 @@ macro_rules! bad_key {
 }
 
 /// The hand-written bool and numeric branches of the map-key deserializer:
-/// quoted key text is parsed by the target key type. Numbers use Rust's
-/// `FromStr` grammar — looser than serde_json's JSON-grammar numeric keys —
-/// and this test pins that behavior, including the divergences.
+/// quoted key text is parsed by the target key type. Numbers go through the
+/// crate's own JSON5 number grammar — the same `number.rs` entries the value
+/// path uses — so keys accept hex, a leading `+` and the `Infinity`/`NaN`
+/// spellings while serde_json's JSON-grammar numeric keys reject them, and
+/// Rust-only `FromStr` spellings (`inf`, case-variant keywords) are refused.
+/// This test pins that behavior, including the divergences.
 #[test]
 fn map_key_bool_and_number_branches() {
     // Bool keys: quoted or bare identifier, exactly `true`/`false`.
@@ -763,12 +766,13 @@ fn map_key_bool_and_number_branches() {
     // would tie to even (1.0).
     assert_single_key::<F32Key>(r#"{ "1.0000000596046448": 1 }"#, &F32Key(1.000_000_1));
 
-    // FromStr accepts a leading `+` for integers too, and the float
-    // spellings `Infinity`/`NaN`; serde_json's numeric keys reject all of
-    // these (their grammar is JSON's).
+    // A leading `+` and the float spellings `Infinity`/`NaN` parse for keys
+    // like values; serde_json's numeric keys reject all of these (their
+    // grammar is JSON's).
     assert_single_key::<i64>(r#"{ "+1": 1 }"#, &1);
     assert_single_key::<u64>(r#"{ "+1": 1 }"#, &1);
     assert_single_key::<F64Key>(r#"{ "Infinity": 1 }"#, &F64Key(f64::INFINITY));
+    assert_single_key::<F64Key>(r#"{ "+Infinity": 1 }"#, &F64Key(f64::INFINITY));
     assert_single_key::<F64Key>(r#"{ "-Infinity": 1 }"#, &F64Key(f64::NEG_INFINITY));
     let m: HashMap<F64Key, u8> = de::from_str(r#"{ "NaN": 1 }"#).unwrap();
     assert!(m.into_keys().next().unwrap().0.is_nan());
@@ -776,16 +780,45 @@ fn map_key_bool_and_number_branches() {
     assert!(serde_json::from_str::<HashMap<F64Key, u8>>(r#"{ "Infinity": 1 }"#).is_err());
     assert!(serde_json::from_str::<HashMap<F64Key, u8>>(r#"{ "NaN": 1 }"#).is_err());
 
+    // Every JSON5-only number spelling is a key wherever it is a value: hex
+    // (each width's parse entry), elided fractions and keyword floats.
+    assert_single_key::<i64>(r#"{ "0x1F": 1 }"#, &31);
+    assert_single_key::<i64>(r#"{ "-0x10": 1 }"#, &-16);
+    assert_single_key::<u128>(r#"{ "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF": 1 }"#, &u128::MAX);
+    assert_single_key::<i128>(r#"{ "18446744073709551616": 1 }"#, &(1_i128 << 64));
+    assert_single_key::<F64Key>(r#"{ "0x10": 1 }"#, &F64Key(16.0));
+    assert_single_key::<F64Key>(r#"{ ".5": 1 }"#, &F64Key(0.5));
+    assert_single_key::<F64Key>(r#"{ "5.": 1 }"#, &F64Key(5.0));
+    assert_single_key::<F64Key>(r#"{ "1.e3": 1 }"#, &F64Key(1000.0));
+    // The f32 key parse evaluates at f32 precision like the value path.
+    assert_single_key::<F32Key>(r#"{ "0x10": 1 }"#, &F32Key(16.0));
+
+    // `-0` keys narrow to signless zero like the value path (the integer
+    // variants hold it), where `FromStr` rejected them for unsigned targets
+    // and produced -0.0 for floats.
+    assert_single_key::<u8>(r#"{ "-0": 1 }"#, &0);
+    assert_single_key::<u64>(r#"{ "-0": 1 }"#, &0);
+    let m: HashMap<F64Key, u8> = de::from_str(r#"{ "-0": 1 }"#).unwrap();
+    let zero = m.into_keys().next().unwrap().0;
+    assert!((zero == 0.0) && !zero.is_sign_negative());
+
+    // Rust-only `FromStr` spellings are not JSON5: case-variant keywords
+    // fail for float keys (and were never valid integer keys).
+    bad_key!(F64Key, "expected f64", r#"{ "inf": 1 }"#);
+    bad_key!(F64Key, "expected f64", r#"{ "infinity": 1 }"#);
+    bad_key!(F64Key, "expected f64", r#"{ "-INF": 1 }"#);
+    bad_key!(F64Key, "expected f64", r#"{ "nan": 1 }"#);
+    bad_key!(F64Key, "expected f64", r#"{ "NAN": 1 }"#);
+    bad_key!(F64Key, "expected f64", r#"{ "InfinityX": 1 }"#);
+
     // Failures are `invalid value` errors naming the expected type.
     bad_key!(i8, "expected i8", r#"{ "128": 1 }"#);
     bad_key!(u8, "expected u8", r#"{ "-1": 1 }"#);
     bad_key!(i64, "expected i64", r#"{ "x": 1 }"#);
     bad_key!(i64, "expected i64", r#"{ "1.5": 1 }"#);
     bad_key!(i64, "expected i64", r#"{ "Infinity": 1 }"#);
-    bad_key!(F64Key, "expected f64", r#"{ "0x10": 1 }"#);
     bad_key!(F64Key, "expected f64", r#"{ "abc": 1 }"#);
     // The f32 key error names f32, not f64.
-    bad_key!(F32Key, "expected f32", r#"{ "0x10": 1 }"#);
     bad_key!(F32Key, "expected f32", r#"{ "abc": 1 }"#);
     bad_key!(
         i128,

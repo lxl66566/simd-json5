@@ -828,13 +828,14 @@ impl<'de> de::MapAccess<'de> for MapAccess<'_, '_, 'de> {
 
 /// Offers an already-parsed key string to a field or map-key seed, borrowed
 /// when the source had no escapes. Bool and numeric requests parse the key
-/// text — numbers through Rust's `FromStr` grammar, which is looser than
-/// serde_json's JSON-grammar numeric keys (a leading `+` and the float
-/// spellings `Infinity`/`NaN` are accepted) — and enum requests treat it as
-/// the variant name; everything else forwards to `deserialize_any` so
-/// mismatched key types still produce standard serde type errors. The
-/// numeric and bool behavior is pinned by the map-key tests in
-/// `tests/typed_deserialize.rs`.
+/// text — numbers through the crate's JSON5 number grammar, the same
+/// `number.rs` entries the value path uses, so a key accepts exactly the
+/// spellings a bare value accepts (hex, a leading `+`, `Infinity`/`NaN`)
+/// while Rust-only `FromStr` spellings (`inf`, case-variant keywords) are
+/// rejected — and enum requests treat it as the variant name; everything
+/// else forwards to `deserialize_any` so mismatched key types still produce
+/// standard serde type errors. The numeric and bool behavior is pinned by
+/// the map-key tests in `tests/typed_deserialize.rs`.
 struct MapKeyDeserializer<'de> {
     key: Str<'de>,
 }
@@ -847,15 +848,76 @@ impl<'de> MapKeyDeserializer<'de> {
         }
     }
 
-    /// Parse the key text as a number for numeric map-key types, through
-    /// Rust's `FromStr` grammar — deliberately looser than the document's
-    /// number grammar, since quoted keys carry arbitrary text and `FromStr`
-    /// accepts forms `parse_num` never sees (`+1`, `Infinity`). Pinned by
-    /// the map-key tests in `tests/typed_deserialize.rs`.
-    fn parse_key_number<T: core::str::FromStr>(self, expecting: &'static str) -> Result<T> {
+    /// Integer key at 64-bit width: [`number::parse_num`]'s grammar and
+    /// variants narrowed to `T` by magnitude. Float and keyword spellings
+    /// are invalid for integer targets, and `-0` narrows to `0` for signed
+    /// and unsigned alike — the integer variants hold signless zero, so the
+    /// value path's `visit_i64(0)` accepts it too. Every failure reports the
+    /// key string, the `FromStr`-era error text.
+    fn parse_key_int<T>(self, expecting: &'static str) -> Result<T>
+    where
+        T: TryFrom<i64> + TryFrom<u64>,
+    {
         let s = self.key.as_str();
-        s.parse()
-            .map_err(|_| de::Error::invalid_value(Unexpected::Str(s), &expecting))
+        let narrow = |n| match n {
+            Num::U64(u) => T::try_from(u).ok(),
+            Num::I64(i) => T::try_from(i).ok(),
+            Num::F64(_) => None,
+        };
+        number::parse_num(s.as_bytes(), 0)
+            .ok()
+            .and_then(narrow)
+            .ok_or_else(|| de::Error::invalid_value(Unexpected::Str(s), &expecting))
+    }
+
+    /// Integer key at 128-bit width, like [`Self::parse_key_int`] through
+    /// [`number::parse_num_wide`]: decimal and hex literals stay exact
+    /// across the whole 128-bit range, past it they are invalid.
+    fn parse_key_wide_int<T>(self, expecting: &'static str) -> Result<T>
+    where
+        T: TryFrom<i128> + TryFrom<u128>,
+    {
+        let s = self.key.as_str();
+        let narrow = |n| match n {
+            Num128::U128(u) => T::try_from(u).ok(),
+            Num128::I128(i) => T::try_from(i).ok(),
+            Num128::F64(_) => None,
+        };
+        number::parse_num_wide(s.as_bytes(), 0)
+            .ok()
+            .and_then(narrow)
+            .ok_or_else(|| de::Error::invalid_value(Unexpected::Str(s), &expecting))
+    }
+
+    /// f64 key: [`number::parse_num`]'s value mapping, integer spellings
+    /// included with the same lossy `as` cast the f64 visitor's integer
+    /// visits perform.
+    #[allow(clippy::cast_precision_loss)] // the value path's visit_u64/visit_i64 casts
+    fn parse_key_f64(self) -> Result<f64> {
+        let s = self.key.as_str();
+        number::parse_num(s.as_bytes(), 0)
+            .ok()
+            .map(|n| match n {
+                Num::U64(u) => u as f64,
+                Num::I64(i) => i as f64,
+                Num::F64(f) => f,
+            })
+            .ok_or_else(|| de::Error::invalid_value(Unexpected::Str(s), &"f64"))
+    }
+
+    /// f32 key: [`number::parse_num_f32`]'s single decimal rounding,
+    /// integer spellings converted like the f32 visitor's integer visits.
+    #[allow(clippy::cast_precision_loss)] // the value path's visit_u64/visit_i64 casts
+    fn parse_key_f32(self) -> Result<f32> {
+        let s = self.key.as_str();
+        number::parse_num_f32(s.as_bytes(), 0)
+            .ok()
+            .map(|n| match n {
+                NumF32::U64(u) => u as f32,
+                NumF32::I64(i) => i as f32,
+                NumF32::F32(f) => f,
+            })
+            .ok_or_else(|| de::Error::invalid_value(Unexpected::Str(s), &"f32"))
     }
 }
 
@@ -907,7 +969,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<i8>("i8")
+        self.parse_key_int::<i8>("i8")
             .and_then(|v| visitor.visit_i8(v))
     }
 
@@ -915,7 +977,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<i16>("i16")
+        self.parse_key_int::<i16>("i16")
             .and_then(|v| visitor.visit_i16(v))
     }
 
@@ -923,7 +985,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<i32>("i32")
+        self.parse_key_int::<i32>("i32")
             .and_then(|v| visitor.visit_i32(v))
     }
 
@@ -931,7 +993,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<i64>("i64")
+        self.parse_key_int::<i64>("i64")
             .and_then(|v| visitor.visit_i64(v))
     }
 
@@ -939,7 +1001,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<u8>("u8")
+        self.parse_key_int::<u8>("u8")
             .and_then(|v| visitor.visit_u8(v))
     }
 
@@ -947,7 +1009,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<u16>("u16")
+        self.parse_key_int::<u16>("u16")
             .and_then(|v| visitor.visit_u16(v))
     }
 
@@ -955,7 +1017,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<u32>("u32")
+        self.parse_key_int::<u32>("u32")
             .and_then(|v| visitor.visit_u32(v))
     }
 
@@ -963,7 +1025,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<u64>("u64")
+        self.parse_key_int::<u64>("u64")
             .and_then(|v| visitor.visit_u64(v))
     }
 
@@ -971,7 +1033,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<i128>("i128")
+        self.parse_key_wide_int::<i128>("i128")
             .and_then(|v| visitor.visit_i128(v))
     }
 
@@ -979,7 +1041,7 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<u128>("u128")
+        self.parse_key_wide_int::<u128>("u128")
             .and_then(|v| visitor.visit_u128(v))
     }
 
@@ -987,16 +1049,14 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number::<f32>("f32")
-            .and_then(|v| visitor.visit_f32(v))
+        self.parse_key_f32().and_then(|v| visitor.visit_f32(v))
     }
 
     fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.parse_key_number("f64")
-            .and_then(|v| visitor.visit_f64(v))
+        self.parse_key_f64().and_then(|v| visitor.visit_f64(v))
     }
 
     fn deserialize_enum<V>(
