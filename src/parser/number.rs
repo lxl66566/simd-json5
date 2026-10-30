@@ -442,13 +442,12 @@ fn parse_decimal(s: &[u8], neg: bool, offset: usize) -> Result<Num> {
                 return Ok(Num::F64(signed(neg, pow10_fast(significant, dec_exp))));
             }
         }
-        // Fraction layout facts come straight from the validation pass; no
-        // second scan for the dot position.
-        let leading_dot = int_digits == 0;
+        // Fraction layout facts (leading-dot and dot position) come
+        // straight from the validation pass; no second scan for the dot.
         let elided_frac = had_dot && frac_digits == 0;
         return Ok(Num::F64(signed(
             neg,
-            float_value(s, leading_dot, elided_frac, offset)?,
+            float_value(s, int_digits, elided_frac, offset)?,
         )));
     }
     // Pure integer: keep the integer variant while the magnitude fits.
@@ -504,13 +503,16 @@ fn pow10_fast(significant: u64, exp: i64) -> f64 {
     }
 }
 
-/// Evaluate an unsigned, grammar-validated decimal as f64. `leading_dot`
-/// marks `.5` forms and `elided_frac` marks `5.` / `1.e3` forms; both are
-/// normalized (to `0.5` / `5.0`) because C `from_chars` semantics are not
-/// guaranteed for elided digit runs by every backend. Both flags come from
-/// the grammar pass, so no byte is scanned twice. A parse failure of both
-/// float backends surfaces as `Error::InvalidNumber` at `offset`.
-fn float_value(s: &[u8], leading_dot: bool, elided_frac: bool, offset: usize) -> Result<f64> {
+/// Evaluate an unsigned, grammar-validated decimal as f64. `int_digits`
+/// is the integer-digit count from the grammar pass: zero marks `.5`
+/// forms, and under `elided_frac` (`5.` / `1.e3`) it is the dot position.
+/// The normalized forms (`0.5` / `5.0`) are assembled from it because C
+/// `from_chars` semantics are not guaranteed for elided digit runs by
+/// every backend. Every layout fact comes from the grammar pass, so no
+/// byte is scanned twice. A parse failure of both float backends surfaces
+/// as `Error::InvalidNumber` at `offset`.
+fn float_value(s: &[u8], int_digits: usize, elided_frac: bool, offset: usize) -> Result<f64> {
+    let leading_dot = int_digits == 0;
     if !leading_dot && !elided_frac {
         return lib_parse(s, offset);
     }
@@ -527,14 +529,13 @@ fn float_value(s: &[u8], leading_dot: bool, elided_frac: bool, offset: usize) ->
             n += 1;
         }
         if elided_frac {
-            // A single dot with digits before it and none after: `5.` / `1.e3`.
-            let dot = s.iter().position(|&b| b == b'.').unwrap_or(0);
-            buf[n..=n + dot].copy_from_slice(&s[..=dot]);
-            n += dot + 1;
+            // The dot sits after `int_digits` digits: `5.` / `1.e3`.
+            buf[n..=n + int_digits].copy_from_slice(&s[..=int_digits]);
+            n += int_digits + 1;
             buf[n] = b'0';
             n += 1;
-            buf[n..n + s.len() - dot - 1].copy_from_slice(&s[dot + 1..]);
-            n += s.len() - dot - 1;
+            buf[n..n + s.len() - int_digits - 1].copy_from_slice(&s[int_digits + 1..]);
+            n += s.len() - int_digits - 1;
         } else {
             buf[n..n + s.len()].copy_from_slice(s);
             n += s.len();
@@ -546,10 +547,9 @@ fn float_value(s: &[u8], leading_dot: bool, elided_frac: bool, offset: usize) ->
             buf.push(b'0');
         }
         if elided_frac {
-            let dot = s.iter().position(|&b| b == b'.').unwrap_or(0);
-            buf.extend_from_slice(&s[..=dot]);
+            buf.extend_from_slice(&s[..=int_digits]);
             buf.push(b'0');
-            buf.extend_from_slice(&s[dot + 1..]);
+            buf.extend_from_slice(&s[int_digits + 1..]);
         } else {
             buf.extend_from_slice(s);
         }
@@ -802,6 +802,11 @@ mod tests {
         // float_value (one below, one at it) both normalize identically.
         assert_eq!(num(&format!(".5e{}", "0".repeat(60))), Value::F64(0.5));
         assert_eq!(num(&format!(".5e{}", "0".repeat(61))), Value::F64(0.5));
+        // Elided-fraction forms at the same boundary, and a leading dot
+        // with an exponent.
+        assert_eq!(num(".5e3"), Value::F64(500.0));
+        assert_eq!(num(&format!("1.e{}", "0".repeat(60))), Value::F64(1.0));
+        assert_eq!(num(&format!("1.e{}", "0".repeat(61))), Value::F64(1.0));
     }
 
     #[test]
