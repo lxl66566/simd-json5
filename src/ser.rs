@@ -5,6 +5,10 @@
 //! emitted as UTF-8 with only the mandatory escapes (`"`, `\`, control
 //! characters below `0x20`).
 //!
+//! On the serde path, map keys must be string-like: `Some(inner)` option keys
+//! forward to the inner value, while `None` and other non-string keys are
+//! rejected with an error.
+//!
 //! Pretty output uses two-space indentation and `": "` after keys, byte
 //! compatible with `serde_json::to_string_pretty` on JSON-representable
 //! values.
@@ -1209,7 +1213,9 @@ pub(crate) mod serde_impls {
 
     /// Key-only serializer. Map keys are restricted to strings and string-like
     /// scalars (chars, unit variant names); everything else is rejected
-    /// through [`Error::Custom`].
+    /// through [`Error::Custom`]. Option keys forward through `Some` to the
+    /// inner value; `None` has no JSON5 key representation and is rejected
+    /// like the other non-strings.
     struct KeySerializer<'w> {
         writer: &'w mut Writer,
     }
@@ -1281,11 +1287,13 @@ pub(crate) mod serde_impls {
             unsupported_key()
         }
 
-        fn serialize_some<T>(self, _value: &T) -> Result<()>
+        /// `Some(inner)` keys serialize as the inner value, so maps keyed by
+        /// option types work whenever the inner values are string-like.
+        fn serialize_some<T>(self, value: &T) -> Result<()>
         where
             T: ?Sized + Serialize,
         {
-            unsupported_key()
+            value.serialize(self)
         }
 
         fn serialize_unit(self) -> Result<()> {
@@ -1638,6 +1646,30 @@ mod serde_tests {
         );
         assert_eq!(compact(&EmptyMap), "{}");
         assert_eq!(pretty(&EmptyMap), "{}");
+    }
+
+    /// Option keys: `Some(inner)` forwards to the inner value; `None` has no
+    /// JSON5 key representation and is rejected like other non-strings.
+    #[test]
+    fn option_map_keys() {
+        let mut keys = BTreeMap::new();
+        keys.insert(Some("k"), 1);
+        keys.insert(Some("z"), 2);
+        assert_eq!(compact(&keys), r#"{"k":1,"z":2}"#);
+        assert_eq!(pretty(&keys), "{\n  \"k\": 1,\n  \"z\": 2\n}");
+
+        let mut char_key = BTreeMap::new();
+        char_key.insert(Some('c'), 1);
+        assert_eq!(compact(&char_key), r#"{"c":1}"#);
+
+        let mut with_none = BTreeMap::new();
+        with_none.insert(Some("k"), 1);
+        with_none.insert(None, 2);
+        let error = to_bytes(&with_none, false).unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Custom(ref message) if &**message == "map keys must be strings"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
