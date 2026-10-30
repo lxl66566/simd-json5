@@ -494,6 +494,76 @@ fn typed_number_fast_path_targets() {
     );
 }
 
+/// 128-bit integer targets parse exactly past the u64/i64 variants, wherever
+/// the literal sits; literals beyond the 128-bit range are number errors,
+/// and range/type mismatches stay serde errors.
+#[test]
+fn wide_integer_targets() {
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Wide {
+        a: u128,
+        b: i128,
+    }
+    let v: Wide =
+        de::from_str("{ a: 18446744073709551616, b: -170141183460469231731687303715884105728, }")
+            .unwrap();
+    assert_eq!(v, Wide {
+        a: 1_u128 << 64,
+        b: i128::MIN
+    });
+    assert_eq!(
+        de::from_str::<u128>("340282366920938463463374607431768211455").unwrap(),
+        u128::MAX
+    );
+    assert_eq!(
+        de::from_str::<u128>("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF").unwrap(),
+        u128::MAX
+    );
+    assert_eq!(
+        de::from_str::<i128>("170141183460469231731687303715884105727").unwrap(),
+        i128::MAX
+    );
+    assert_eq!(
+        de::from_str::<Vec<u128>>("[1, 18446744073709551616, 0x20]").unwrap(),
+        vec![1, 1_u128 << 64, 32]
+    );
+
+    // Past the 128-bit range: InvalidNumber at the token, like grammar errors.
+    assert_eq!(
+        de::from_str::<u128>("340282366920938463463374607431768211456").unwrap_err(),
+        Error::InvalidNumber { offset: 0 }
+    );
+    assert_eq!(
+        de::from_str::<Wide>("{ a: 1, b: -170141183460469231731687303715884105729 }").unwrap_err(),
+        Error::InvalidNumber { offset: 11 }
+    );
+    assert_eq!(
+        de::from_str::<u128>("0x100000000000000000000000000000000").unwrap_err(),
+        Error::InvalidNumber { offset: 0 }
+    );
+
+    // Range and sign mismatches are serde value errors, not parse errors.
+    let err = de::from_str::<i128>("340282366920938463463374607431768211455").unwrap_err();
+    assert!(
+        matches!(&err, Error::Syntax { message, .. } if message.contains("invalid value")),
+        "{err:?}"
+    );
+    let err = de::from_str::<u128>("-1").unwrap_err();
+    assert!(
+        matches!(&err, Error::Syntax { message, .. } if message.contains("invalid value")),
+        "{err:?}"
+    );
+
+    // Float and keyword spellings stay type errors for integer visitors.
+    for doc in ["1.0", "1e3", "Infinity", "-Infinity", "NaN"] {
+        let err = de::from_str::<u128>(doc).unwrap_err();
+        assert!(
+            matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type")),
+            "doc {doc}: {err:?}"
+        );
+    }
+}
+
 /// Number grammar errors keep their variant and byte offset on the typed
 /// walk, both at the root and inside containers.
 #[test]

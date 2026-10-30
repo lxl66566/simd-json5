@@ -10,6 +10,11 @@
 //! step by step (`f * 16.0 + digit`); the stepwise rounding may differ from
 //! a correctly rounded conversion by 1 ULP. Inputs that large are out of
 //! scope.
+//!
+//! The serde i128/u128 visitors get a dedicated entry: [`parse_num_wide`]
+//! keeps 128-bit integer literals exact (rejecting those past the 128-bit
+//! range). The DOM and `deserialize_any` paths use [`parse_num`]/[`Num`]
+//! unchanged.
 
 use crate::{Error, Result, value::Value};
 
@@ -31,6 +36,17 @@ pub(crate) fn hex_val(b: u8) -> Option<u8> {
 pub(crate) enum Num {
     I64(i64),
     U64(u64),
+    F64(f64),
+}
+
+/// A parsed number for the serde i128/u128 visitors: the [`Num`] variants
+/// widened to 128 bits, with integer literals held exactly however long they
+/// are (within the 128-bit range).
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Num128 {
+    I128(i128),
+    U128(u128),
     F64(f64),
 }
 
@@ -67,6 +83,71 @@ pub(crate) fn parse_num(token: &[u8], offset: usize) -> Result<Num> {
         return parse_hex(&rest[2..], neg, offset);
     }
     parse_decimal(rest, neg, offset)
+}
+
+/// 2^127, the i128 negation boundary (the 128-bit counterpart of parse_hex's
+/// and parse_decimal's 2^63 boundaries).
+const TWO_POW_127: u128 = 1 << 127;
+
+/// Exact u128 accumulation of digit bytes in `base`, `None` on overflow past
+/// u128. Each byte is mapped through `val`; a `None` there aborts too, so
+/// callers pair the fold with their digit classifier.
+fn accumulate(digits: &[u8], base: u128, val: impl Fn(u8) -> Option<u128>) -> Option<u128> {
+    digits.iter().try_fold(0_u128, |acc, &d| {
+        acc.checked_mul(base)?.checked_add(val(d)?)
+    })
+}
+
+/// Sign tail of the wide integer parses. `acc == 2^127` wraps to i128::MIN,
+/// whose negation is itself (the same convention as the 64-bit paths); a
+/// negative magnitude past 2^127 leaves the 128-bit range and is invalid.
+#[allow(clippy::cast_possible_wrap)] // acc <= 2^127, so `as i128` only "wraps" 2^127 to i128::MIN
+fn wide_signed(acc: u128, neg: bool, offset: usize) -> Result<Num128> {
+    if !neg {
+        return Ok(Num128::U128(acc));
+    }
+    if acc > TWO_POW_127 {
+        return Err(invalid_number(offset));
+    }
+    Ok(Num128::I128((acc as i128).wrapping_neg()))
+}
+
+/// Parse a bare number token for the serde i128/u128 visitors, exact across
+/// the whole 128-bit range. A maximal token of plain decimal digits (or a
+/// `0x` run of hex digits) is a valid integer literal by construction, so it
+/// accumulates directly at u128 width instead of overflowing [`Num`]'s u64
+/// accumulator into f64; literals past u128::MAX / i128::MIN are
+/// [`Error::InvalidNumber`]. Everything else — floats, keywords, malformed
+/// tokens — keeps [`parse_num`]'s grammar and F64 value, which the integer
+/// visitors reject as a type error.
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
+pub(crate) fn parse_num_wide(token: &[u8], offset: usize) -> Result<Num128> {
+    let (neg, rest) = match token.first() {
+        Some(&b'+') => (false, &token[1..]),
+        Some(&b'-') => (true, &token[1..]),
+        _ => (false, token),
+    };
+    if let Some(&first) = rest.first()
+        && first.is_ascii_digit()
+        && rest[1..].iter().all(u8::is_ascii_digit)
+    {
+        let acc = accumulate(rest, 10, |d| Some(u128::from(d - b'0')))
+            .ok_or_else(|| invalid_number(offset))?;
+        return wide_signed(acc, neg, offset);
+    }
+    if matches!(rest.first(), Some(&b'0') if matches!(rest.get(1), Some(&(b'x' | b'X')))) {
+        let digits = &rest[2..];
+        if !digits.is_empty() && digits.iter().all(|d| hex_val(*d).is_some()) {
+            let acc = accumulate(digits, 16, |d| hex_val(d).map(u128::from))
+                .ok_or_else(|| invalid_number(offset))?;
+            return wide_signed(acc, neg, offset);
+        }
+    }
+    Ok(match parse_num(token, offset)? {
+        Num::I64(i) => Num128::I128(i128::from(i)),
+        Num::U64(u) => Num128::U128(u128::from(u)),
+        Num::F64(f) => Num128::F64(f),
+    })
 }
 
 /// DOM entry: the grammar in [`parse_num`] mapped onto [`Value`] variants.
@@ -785,6 +866,114 @@ mod tests {
         }
         for t in ["Infinity", "NaN", "true", "false", "null", "x", "_", "$"] {
             assert!(!is_num_start(t.as_bytes()[0]), "token {t:?}");
+        }
+    }
+
+    #[test]
+    fn wide_integer_literals_exact() {
+        let wide = |t: &str| parse_num_wide(t.as_bytes(), 0).unwrap();
+        assert_eq!(wide("0"), Num128::U128(0));
+        assert_eq!(wide("+1"), Num128::U128(1));
+        assert_eq!(wide("-1"), Num128::I128(-1));
+        assert_eq!(wide("-0"), Num128::I128(0));
+        assert_eq!(wide("007"), Num128::U128(7));
+        // The u64/i64 boundaries and one past them, where `parse_num` overflows to F64.
+        assert_eq!(
+            wide("18446744073709551615"),
+            Num128::U128(u128::from(u64::MAX))
+        );
+        assert_eq!(wide("18446744073709551616"), Num128::U128(1 << 64));
+        assert_eq!(
+            wide("-9223372036854775808"),
+            Num128::I128(i128::from(i64::MIN))
+        );
+        assert_eq!(
+            wide("-9223372036854775809"),
+            Num128::I128(i128::from(i64::MIN) - 1)
+        );
+        // The 128-bit boundaries.
+        assert_eq!(
+            wide("340282366920938463463374607431768211455"),
+            Num128::U128(u128::MAX)
+        );
+        assert_eq!(
+            wide("-170141183460469231731687303715884105728"),
+            Num128::I128(i128::MIN)
+        );
+        // Hex, both prefixes and signs, at the same boundaries.
+        assert_eq!(wide("0x0"), Num128::U128(0));
+        assert_eq!(wide("+0x10"), Num128::U128(16));
+        assert_eq!(wide("-0x10"), Num128::I128(-16));
+        assert_eq!(
+            wide("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+            Num128::U128(u128::MAX)
+        );
+        assert_eq!(
+            wide("-0x80000000000000000000000000000000"),
+            Num128::I128(i128::MIN)
+        );
+    }
+
+    #[test]
+    fn wide_integer_literals_out_of_range() {
+        for t in [
+            "340282366920938463463374607431768211456",  // 2^128
+            "-170141183460469231731687303715884105729", // i128::MIN - 1
+            "0x100000000000000000000000000000000",      // 2^128 in hex
+            "-0x80000000000000000000000000000001",
+            "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", // 33 hex digits
+            "99999999999999999999999999999999999999999999999999", // 50 digits
+        ] {
+            assert_eq!(
+                parse_num_wide(t.as_bytes(), 0),
+                Err(Error::InvalidNumber { offset: 0 }),
+                "token {t}"
+            );
+        }
+        // The error carries the token's input offset.
+        assert_eq!(
+            parse_num_wide(b"340282366920938463463374607431768211456", 9).unwrap_err(),
+            Error::InvalidNumber { offset: 9 }
+        );
+    }
+
+    #[test]
+    fn wide_entry_matches_parse_num_off_integers() {
+        // Float and keyword spellings keep parse_num's F64 value (the 128-bit
+        // integer visitors reject them as type errors)...
+        assert_eq!(parse_num_wide(b"1.5", 0), Ok(Num128::F64(1.5)));
+        assert_eq!(parse_num_wide(b"1e3", 0), Ok(Num128::F64(1000.0)));
+        assert_eq!(parse_num_wide(b"5.", 0), Ok(Num128::F64(5.0)));
+        assert_eq!(parse_num_wide(b".5", 0), Ok(Num128::F64(0.5)));
+        assert!(matches!(parse_num_wide(b"Infinity", 0), Ok(Num128::F64(f)) if f == f64::INFINITY));
+        assert!(
+            matches!(parse_num_wide(b"-Infinity", 0), Ok(Num128::F64(f)) if f == f64::NEG_INFINITY)
+        );
+        assert!(matches!(parse_num_wide(b"NaN", 0), Ok(Num128::F64(f)) if f.is_nan()));
+        // ...and malformed tokens keep parse_num's exact errors.
+        for t in [
+            "",
+            "+",
+            "-",
+            ".",
+            ".e3",
+            "1e",
+            "1e+",
+            "0x",
+            "0xg",
+            "0x1g",
+            "1a",
+            "1.2.3",
+            "--1",
+            "Infinityx",
+            "e3",
+            "1_0",
+        ] {
+            assert_eq!(
+                parse_num_wide(t.as_bytes(), 0).unwrap_err(),
+                parse_num(t.as_bytes(), 0).unwrap_err(),
+                "token {t:?}"
+            );
         }
     }
 }

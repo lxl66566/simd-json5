@@ -33,7 +33,7 @@ use crate::{
     Error, Result,
     parser::{
         Counts, container_counts, initial_index_capacity,
-        number::{self, Num},
+        number::{self, Num, Num128},
         simd,
         stage1::{CLASSES, Span, class, token_end},
         stage2,
@@ -61,6 +61,11 @@ where
 /// Re-reported as [`Error::Syntax`] they match the always-positioned errors
 /// of the DOM path, like serde_json's located type errors. Errors that
 /// already carry an offset pass through unchanged.
+///
+/// The position is the read cursor where the error surfaced — just past a
+/// consumed value for type mismatches, not the value's start. Reporting the
+/// start would need bookkeeping on the value-dispatch hot path; the cursor
+/// semantic is pinned by `type_errors_carry_offsets`.
 fn locate(e: Error, de: &Deserializer<'_, '_>) -> Error {
     match e {
         Error::Custom(message) => Error::Syntax {
@@ -348,29 +353,48 @@ impl<'a, 'de> Deserializer<'a, 'de> {
         }
     }
 
-    /// Fast path: interpret the entry at `off` as a bare number token and
-    /// advance past it. The caller has checked [`number::is_num_start`] on the
-    /// entry byte, which is exactly the byte set `stage2::token_value` routes
-    /// to `number::parse` — so behavior is identical to the scalar slow path,
-    /// minus the generic token classification and intermediate `Value`.
-    fn parse_current_num(&mut self, off: usize) -> Result<Num> {
+    /// Fast path: interpret the entry at `off` as a bare number token with
+    /// `parse` and advance past it. The caller has checked
+    /// [`number::is_num_start`] on the entry byte, which is exactly the byte
+    /// set `stage2::token_value` routes to `number::parse` — so behavior is
+    /// identical to the scalar slow path, minus the generic token
+    /// classification and intermediate `Value`. The `parse` argument picks
+    /// the number.rs entry: [`number::parse_num`] itself, or the f32 / 128-bit
+    /// flavors the matching visitors use.
+    #[inline]
+    fn parse_current_num_with<T>(
+        &mut self,
+        off: usize,
+        parse: fn(&[u8], usize) -> Result<T>,
+    ) -> Result<T> {
         let end = token_end(self.bytes, off);
-        let n = number::parse_num(&self.bytes[off..end], off)?;
+        let n = parse(&self.bytes[off..end], off)?;
         self.bump();
         Ok(n)
     }
 
+    fn parse_current_num(&mut self, off: usize) -> Result<Num> {
+        self.parse_current_num_with(off, number::parse_num)
+    }
+
     /// Number fast path for the typed scalar methods: parse the current entry
-    /// as a number when it can start one. `None` means the entry cannot start
-    /// a number; the caller keeps its scalar slow path, which owns the
+    /// with `parse` when it can start a number. `None` means the entry cannot
+    /// start a number; the caller keeps its scalar slow path, which owns the
     /// `[`/`{` type errors, the structural-byte diagnostics and the bare
     /// `Infinity`/`NaN` keywords.
-    fn try_current_num(&mut self) -> Option<Result<Num>> {
+    fn try_current_num_with<T>(
+        &mut self,
+        parse: fn(&[u8], usize) -> Result<T>,
+    ) -> Option<Result<T>> {
         let (b, off) = self.peek_entry()?;
         if !number::is_num_start(b) {
             return None;
         }
-        Some(self.parse_current_num(off))
+        Some(self.parse_current_num_with(off, parse))
+    }
+
+    fn try_current_num(&mut self) -> Option<Result<Num>> {
+        self.try_current_num_with(number::parse_num)
     }
 
     /// Dispatch a value to `visitor` by its entry kind.
@@ -965,7 +989,8 @@ impl<'de> serde::Deserializer<'de> for MapKeyDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.deserialize_f64(visitor)
+        self.parse_key_number::<f32>("f32")
+            .and_then(|v| visitor.visit_f32(v))
     }
 
     fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
@@ -1388,11 +1413,13 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
     where
         V: Visitor<'de>,
     {
-        match self.try_current_num() {
-            // The number grammar tops out at u64/i64; widen the hint.
-            Some(Ok(Num::U64(u))) => visitor.visit_u128(u128::from(u)),
-            Some(Ok(Num::I64(i))) => visitor.visit_i128(i128::from(i)),
-            Some(Ok(Num::F64(f))) => visitor.visit_f64(f),
+        match self.try_current_num_with(number::parse_num_wide) {
+            // Exact across the whole 128-bit range; literals past it are
+            // InvalidNumber from the parser, and the visitor owns the
+            // narrower-range value errors (a u128 hint on an i128 target).
+            Some(Ok(Num128::U128(u))) => visitor.visit_u128(u),
+            Some(Ok(Num128::I128(i))) => visitor.visit_i128(i),
+            Some(Ok(Num128::F64(f))) => visitor.visit_f64(f),
             Some(Err(e)) => Err(e),
             None => match self.parse_scalar_or_type_error(&visitor)? {
                 Value::U64(u) => visitor.visit_u128(u128::from(u)),
@@ -1407,19 +1434,7 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
     where
         V: Visitor<'de>,
     {
-        match self.try_current_num() {
-            // The number grammar tops out at u64/i64; widen the hint.
-            Some(Ok(Num::U64(u))) => visitor.visit_u128(u128::from(u)),
-            Some(Ok(Num::I64(i))) => visitor.visit_i128(i128::from(i)),
-            Some(Ok(Num::F64(f))) => visitor.visit_f64(f),
-            Some(Err(e)) => Err(e),
-            None => match self.parse_scalar_or_type_error(&visitor)? {
-                Value::U64(u) => visitor.visit_u128(u128::from(u)),
-                Value::I64(i) => visitor.visit_i128(i128::from(i)),
-                Value::F64(f) => visitor.visit_f64(f),
-                other => Err(invalid_type_value(&other, &visitor)),
-            },
-        }
+        self.deserialize_i128(visitor)
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
@@ -1853,6 +1868,32 @@ mod tests {
         assert!(matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type")));
         let err = from_str::<String>("true").unwrap_err();
         assert!(matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type")));
+    }
+
+    /// 128-bit integer targets parse exactly past the 64-bit variants;
+    /// literals beyond the range are number errors, not float type errors.
+    #[test]
+    fn wide_integer_visitors() {
+        assert_eq!(
+            from_str::<u128>("18446744073709551616").unwrap(),
+            1_u128 << 64
+        );
+        assert_eq!(
+            from_str::<i128>("-9223372036854775809").unwrap(),
+            i128::from(i64::MIN) - 1
+        );
+        assert_eq!(
+            from_str::<u128>("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF").unwrap(),
+            u128::MAX
+        );
+        assert_eq!(
+            from_str::<u128>("340282366920938463463374607431768211456").unwrap_err(),
+            Error::InvalidNumber { offset: 0 }
+        );
+        let err = from_str::<u128>("1.5").unwrap_err();
+        assert!(
+            matches!(&err, Error::Syntax { message, .. } if message.contains("invalid type: floating point"))
+        );
     }
 
     /// serde visitor errors are re-reported with the read position, so typed
