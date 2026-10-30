@@ -541,18 +541,20 @@ fn skip_block_simd<S: Simd>(simd: S, bytes: &[u8], slash: usize) -> Result<usize
         prev_star = stars >> 63 != 0;
         i += 64;
     }
-    // Scalar tail; `prev_star` carries the boundary-straddling `*`.
-    while let Some(hit) = memchr(b'/', &bytes[i..]) {
+    // The boundary-straddling closer (star last in the vector part, slash
+    // first here) is checked up front: the tail search below cannot see
+    // that star.
+    if prev_star && bytes.get(i) == Some(&b'/') {
+        return Ok(i + 1);
+    }
+    // Scalar tail, mirroring the canonical skip_comment: search `*` so
+    // slash-dense comments do not restart the search on every `/`.
+    while let Some(hit) = memchr(b'*', &bytes[i..]) {
         let at = i + hit;
-        // The byte before the first candidate comes from the vector part;
-        // every later candidate has its predecessor inside the tail.
-        let prev_is_star = if hit == 0 {
-            prev_star
-        } else {
-            bytes[at - 1] == b'*'
-        };
-        if prev_is_star {
-            return Ok(at + 1);
+        // A star as the last input byte has no successor and cannot close
+        // the comment.
+        if bytes.get(at + 1) == Some(&b'/') {
+            return Ok(at + 2);
         }
         i = at + 1;
     }
@@ -967,6 +969,18 @@ mod tests {
             byte: b'/',
             offset: 0
         });
+        // Slash-dense comments, in the vector blocks and in the tail.
+        differential(b"/* //// //// */1");
+        assert_eq!(idx(b"/* //// //// */1"), vec![15]);
+        differential(b"/*a*/ /*////*//*/b");
+        // A closer straddling the comment scan's 64-byte block boundary at
+        // every alignment (star last byte of a block, slash first tail
+        // byte): k = 63 and k = 127 land the `*/` exactly on it.
+        for k in 0..=140usize {
+            differential(format!("/*{}*/x", "a".repeat(k)).as_bytes());
+            differential(format!("/*{}*/x", "/".repeat(k)).as_bytes());
+            differential(format!("/*{}*/x", "*".repeat(k)).as_bytes());
+        }
     }
 
     #[test]
