@@ -9,7 +9,7 @@ use std::cell::RefCell;
 
 use crate::{
     Result,
-    parser::stage1::{CLASSES, class},
+    parser::stage1::{CLASSES, Span, class},
     value::Value,
 };
 
@@ -39,13 +39,67 @@ pub(crate) fn initial_index_capacity(len: usize) -> usize {
 /// invalid UTF-8 here is undefined behavior for string content, not an
 /// `Error::InvalidUtf8`. Debug builds assert the contract at every slice.
 pub(crate) fn parse(bytes: &[u8]) -> Result<Value<'_>> {
-    let mut index = Vec::with_capacity(initial_index_capacity(bytes.len()));
-    // No pre-allocation: spans grow amortized and number-heavy documents
-    // would waste it (a string contributes at most one span but at least one
-    // index entry, so the index estimate bounds the waste).
-    let mut spans = Vec::new();
-    simd::build_index(bytes, &mut index, &mut spans)?;
-    stage2::build(bytes, &index, &spans)
+    let mut bufs = Stage1Buffers::take(bytes.len());
+    simd::build_index(bytes, &mut bufs.index, &mut bufs.spans)?;
+    stage2::build(bytes, &bufs.index, &bufs.spans)
+}
+
+thread_local! {
+    /// Reusable stage-1 scratch: the index table.
+    /// The same allocator-cycling rationale as [`COUNTS_POOL`] applies, at
+    /// several times the size — a twitter-scale parse cycles a
+    /// multi-hundred-KiB index block through the allocator every parse.
+    static INDEX_POOL: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// Reusable clean-string span scratch; see [`INDEX_POOL`].
+    static SPANS_POOL: RefCell<Vec<Span>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Stage-1 output buffers borrowed from the thread-local pools, returned on
+/// drop. A parse nested while a pool is borrowed simply takes fresh buffers.
+pub(crate) struct Stage1Buffers {
+    pub(crate) index: Vec<u32>,
+    /// Clean-string spans; capacity comes only from reuse, never from a
+    /// per-parse estimate (a string contributes at most one span but at
+    /// least one index entry, so the index estimate bounds the waste).
+    pub(crate) spans: Vec<Span>,
+}
+
+impl Stage1Buffers {
+    /// Cleared buffers for an input of `len` bytes, reserving the standard
+    /// initial index capacity.
+    pub(crate) fn take(len: usize) -> Self {
+        let hint = initial_index_capacity(len);
+        let mut index = INDEX_POOL.with(|p| core::mem::take(&mut *p.borrow_mut()));
+        index.clear();
+        index.reserve(hint);
+        let mut spans = SPANS_POOL.with(|p| core::mem::take(&mut *p.borrow_mut()));
+        spans.clear();
+        Self { index, spans }
+    }
+}
+
+impl Drop for Stage1Buffers {
+    fn drop(&mut self) {
+        // Keep only the largest recent buffers, and only up to the cap.
+        // Spans hold 8-byte elements, so their element cap halves for the
+        // same byte cap.
+        if self.index.capacity() <= POOL_MAX_ELEMS {
+            INDEX_POOL.with(|p| {
+                let mut p = p.borrow_mut();
+                if p.capacity() < self.index.capacity() {
+                    *p = core::mem::take(&mut self.index);
+                }
+            });
+        }
+        if self.spans.capacity() <= POOL_MAX_ELEMS / 2 {
+            SPANS_POOL.with(|p| {
+                let mut p = p.borrow_mut();
+                if p.capacity() < self.spans.capacity() {
+                    *p = core::mem::take(&mut self.spans);
+                }
+            });
+        }
+    }
 }
 
 /// Documents with fewer index entries return no table: no container in them
@@ -56,6 +110,8 @@ const MIN_COUNT_ENTRIES: usize = 8;
 
 /// Largest scratch buffer kept between parses, in elements (8 MiB of u32):
 /// one huge document must not pin memory for every later parse on the thread.
+/// Shared by the counts, index and span pools; span elements are 8 bytes, so
+/// their element cap halves to keep the same byte bound.
 #[cfg_attr(not(feature = "serde"), allow(dead_code))]
 const POOL_MAX_ELEMS: usize = 2 << 20;
 
@@ -66,7 +122,17 @@ thread_local! {
     /// to the allocator cycling the freed half-megabyte block every parse),
     /// so steady-state parsing borrows one buffer instead of allocating.
     static COUNTS_POOL: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// Reusable open-container stack for [`container_counts`]; see
+    /// [`COUNTS_POOL`] for the pooling rationale.
+    #[cfg_attr(not(feature = "serde"), allow(dead_code))]
+    static OPENS_POOL: RefCell<Vec<(usize, u32)>> = const { RefCell::new(Vec::new()) };
 }
+
+/// Largest open-container stack kept between parses, in entries (64 KiB):
+/// valid documents nest no deeper than `MAX_DEPTH`, so only rejected garbage
+/// could outgrow it, and it must not pin memory.
+#[cfg_attr(not(feature = "serde"), allow(dead_code))]
+const OPENS_POOL_MAX_ELEMS: usize = 4096;
 
 /// The element-count hint table produced by [`container_counts`]. Recycles
 /// its buffer into the thread-local pool when dropped; a nested parse while
@@ -126,9 +192,11 @@ pub(crate) fn container_counts(bytes: &[u8], index: &[u32]) -> Counts {
     counts.clear();
     counts.resize(index.len(), 0);
     // (index position of the `[` / `{`, commas seen at its nesting level).
-    // Typical documents nest far shallower than this; one upfront allocation
-    // covers the whole walk (stage 2 sizes its own stack the same way).
-    let mut opens: Vec<(usize, u32)> = Vec::with_capacity(16);
+    // Borrowed from a pool like the counts table: hinted parses run per
+    // parse, and valid documents never stack deeper than MAX_DEPTH.
+    let mut opens = OPENS_POOL.with(|p| core::mem::take(&mut *p.borrow_mut()));
+    opens.clear();
+    opens.reserve(16);
     for (at, &entry) in index.iter().enumerate() {
         // Stage-1 entries are always valid input positions (< bytes.len());
         // the widening cast is lossless (usize is at least 32 bits).
@@ -162,18 +230,56 @@ pub(crate) fn container_counts(bytes: &[u8], index: &[u32]) -> Counts {
             _ => {},
         }
     }
+    // Return the open-container stack for the next hinted parse on this
+    // thread, keeping the larger buffer up to the depth cap (documents past
+    // MAX_DEPTH are rejected by the parsers anyway; deeper garbage must not
+    // pin an oversized stack).
+    if opens.capacity() <= OPENS_POOL_MAX_ELEMS {
+        OPENS_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.capacity() < opens.capacity() {
+                *p = core::mem::take(&mut opens);
+            }
+        });
+    }
     Counts(counts)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::container_counts;
-    use crate::parser::stage1::build_index;
+    use super::{container_counts, parse};
+    use crate::{Value, parser::stage1::build_index};
 
     fn counts(src: &str) -> super::Counts {
         let mut index = Vec::new();
         build_index(src.as_bytes(), &mut index, &mut Vec::new()).unwrap();
         container_counts(src.as_bytes(), &index)
+    }
+
+    /// Consecutive parses borrow and return the pooled stage-1 buffers;
+    /// results must be unaffected by stale capacity or contents left by
+    /// earlier parses (of any size, success or error).
+    #[test]
+    fn pooled_buffers_reuse_across_parses() {
+        let big = format!(
+            "[{}]",
+            (0..2000)
+                .map(|i| format!("{{n{i}: {i}, s: \"v{i}\"}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let v = parse(big.as_bytes()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2000);
+        assert_eq!(
+            parse(b"[1, 2]").unwrap(),
+            Value::Array(vec![Value::U64(1), Value::U64(2)])
+        );
+        // Error paths return the buffers too (Drop runs on `?`).
+        assert!(parse(b"{a:").is_err());
+        let v = parse(b"{a: 1, b: 'x'}").unwrap();
+        let m = v.as_object().unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get_index(1).unwrap().1.as_str(), Some("x"));
     }
 
     /// `{a: [1, 2,], b: [], c: {}}`: entries 0 `{`, 3 `[`, 12 `[`, 17 `{`

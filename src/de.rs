@@ -32,7 +32,7 @@ use serde::de::{self, DeserializeSeed, Unexpected, Visitor};
 use crate::{
     Error, Result,
     parser::{
-        Counts, container_counts, initial_index_capacity,
+        Counts, Stage1Buffers, container_counts,
         number::{self, Num, Num128, NumF32},
         simd,
         stage1::{CLASSES, Span, class, token_end},
@@ -47,10 +47,9 @@ pub fn from_str<'de, T>(s: &'de str) -> Result<T>
 where
     T: serde::Deserialize<'de>,
 {
-    let mut index = Vec::with_capacity(initial_index_capacity(s.len()));
-    let mut spans = Vec::new();
-    simd::build_index(s.as_bytes(), &mut index, &mut spans)?;
-    let mut de = Deserializer::new(s.as_bytes(), &index, &spans);
+    let mut bufs = Stage1Buffers::take(s.len());
+    simd::build_index(s.as_bytes(), &mut bufs.index, &mut bufs.spans)?;
+    let mut de = Deserializer::new(s.as_bytes(), &bufs.index, &bufs.spans);
     let value = T::deserialize(&mut de).map_err(|e| locate(e, &de))?;
     de.end()?;
     Ok(value)

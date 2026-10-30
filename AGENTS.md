@@ -13,6 +13,7 @@ Project policy for agents working in this repository:
 - Serializer map keys must be string-like: `str`, `char`, unit-variant names, and `Some(inner)` of a string-like value. `None` and other non-strings are rejected.
 - `SerializeMap` protocol violations (key without value, and similar) raise an error instead of emitting malformed JSON5.
 - `Value::Object` equality compares member sets and ignores insertion order; insertion order governs iteration and serialization only.
+- `parser::parse` and `de::from_str` draw stage-1 buffers from thread-local pools (the COUNTS_POOL policy); new stage-1 entry points should use `parser::Stage1Buffers::take` instead of allocating.
 
 ## Benchmarking
 
