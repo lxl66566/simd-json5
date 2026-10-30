@@ -1,6 +1,6 @@
 //! DOM accessor semantics: lookups and index fallbacks, cross-variant
-//! number conversions, the integer equality contract, and ownership
-//! transfer through `into_owned`.
+//! number conversions, the equality contract, and ownership transfer
+//! through `into_owned`.
 
 use simd_json5::{Str, Value};
 
@@ -64,6 +64,20 @@ fn integer_equality_across_variants() {
     let nan = Value::F64(f64::NAN);
     let nan2 = nan.clone();
     assert_ne!(nan, nan2);
+}
+
+/// Object equality compares member sets and ignores insertion order
+/// (IndexMap semantics, as in serde_json); insertion order still governs
+/// iteration and serialization.
+#[test]
+fn object_equality_ignores_member_order() {
+    let v = simd_json5::from_str(r"{ a: 1, b: 2 }").unwrap();
+    let same_order = simd_json5::from_str(r"{ a: 1, b: 2 }").unwrap();
+    let reordered = simd_json5::from_str(r"{ b: 2, a: 1 }").unwrap();
+    assert_eq!(v, same_order);
+    assert_eq!(v, reordered);
+    let different = simd_json5::from_str(r"{ a: 1, b: 3 }").unwrap();
+    assert_ne!(v, different);
 }
 
 /// `into_owned` deep-converts every borrowed string to an owned one, so

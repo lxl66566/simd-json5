@@ -12,7 +12,8 @@ use indexmap::IndexMap;
 
 /// Object map preserving insertion order, matching JavaScript semantics.
 /// Duplicate keys keep the position of the first occurrence and the value of
-/// the last.
+/// the last. Insertion order governs iteration and serialization; equality
+/// compares member sets and ignores order.
 pub type Map<'a> = IndexMap<Str<'a>, Value<'a>>;
 
 /// Maximum container nesting accepted by the parser. Bounds stack usage of
@@ -133,7 +134,8 @@ pub enum Value<'a> {
 
 /// Equality compares string content and numerically equal integer variants
 /// (`I64(1) == U64(1)`). Floats never equal integers; `F64(NaN)` equals
-/// nothing.
+/// nothing. Objects compare by member set, ignoring insertion order:
+/// `{"a":1,"b":2} == {"b":2,"a":1}`.
 impl PartialEq for Value<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

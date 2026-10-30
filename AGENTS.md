@@ -12,3 +12,4 @@ Project policy for agents working in this repository:
 - Type-error offsets are the read cursor where the error surfaced, not the start of the offending value.
 - Serializer map keys must be string-like: `str`, `char`, unit-variant names, and `Some(inner)` of a string-like value. `None` and other non-strings are rejected.
 - `SerializeMap` protocol violations (key without value, and similar) raise an error instead of emitting malformed JSON5.
+- `Value::Object` equality compares member sets and ignores insertion order; insertion order governs iteration and serialization only.
