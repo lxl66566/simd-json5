@@ -39,6 +39,18 @@ let text = simd_json5::to_string(&value); // {"a":1,"b":[2,3]}
 let pretty = simd_json5::to_string_pretty(&value);
 ```
 
+Point lookups without building a DOM:
+
+```rust
+let src = r#"{ artist: { name: 'Helen', tags: ["a", "b",] } }"#;
+
+let name = simd_json5::get(src, &["artist", "name"]).unwrap().unwrap();
+assert_eq!(name.as_str().unwrap().as_deref(), Some("Helen"));
+
+let tag = simd_json5::get(src, &["artist", "tags", "1"]).unwrap().unwrap();
+assert_eq!(tag.raw(), r#""b""#);
+```
+
 Typed via serde with `serde` feature (enabled by default):
 
 ```rust
