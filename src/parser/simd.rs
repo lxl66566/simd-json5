@@ -76,6 +76,32 @@ fn le_mask16<S: Simd>(simd: S, lane: u8x16<S>, bound: u8) -> u64 {
     lane.simd_le(simd.splat_u8x16(bound)).to_bitmask()
 }
 
+/// Load `width` bytes at `at` at the level's native width, without the
+/// slice bounds check: every caller's block loop guarantees 64 readable
+/// bytes at its block start, and `at` is a native block boundary inside it
+/// (`at + width <= start + 64`). from_slice's own length check folds away,
+/// because the slice length is exactly the lane width.
+#[inline(always)]
+fn load_native<S: Simd>(simd: S, bytes: &[u8], at: usize) -> S::u8s {
+    let width = <S::u8s as SimdBase<S>>::LEN;
+    debug_assert!(at + width <= bytes.len());
+    // SAFETY: callers run a `i + 64 <= len` block loop and pass `at = i + k`
+    // with `k + width <= 64` (k advances by width below 64), so
+    // `at + width <= i + 64 <= len`.
+    <S::u8s as SimdBase<S>>::from_slice(simd, unsafe { bytes.get_unchecked(at..at + width) })
+}
+
+/// Load 16 bytes at `at` as one 128-bit lane on any level (including the
+/// wide lanes, for the generic classifier). Same caller contract as
+/// [`load_native`].
+#[inline(always)]
+fn load16<S: Simd>(simd: S, bytes: &[u8], at: usize) -> u8x16<S> {
+    debug_assert!(at + 16 <= bytes.len());
+    // SAFETY: callers run a `i + 64 <= len` block loop and pass `at` inside
+    // `[i, i + 48]`, so `at + 16 <= i + 64 <= len`.
+    u8x16::from_slice(simd, unsafe { bytes.get_unchecked(at..at + 16) })
+}
+
 /// OR of the equality masks for `byte` over the 64 bytes at `i`, loaded at
 /// the level's native width: one compare per 64 bytes on AVX-512, two on
 /// AVX2, four on 128-bit ISAs. Callers guarantee 64 readable bytes at `i`.
@@ -86,10 +112,7 @@ fn eq_mask_native<S: Simd>(simd: S, bytes: &[u8], i: usize, byte: u8) -> u64 {
     let mut acc = 0_u64;
     let mut k = 0;
     while k < 64 {
-        acc |= <S::u8s as SimdBase<S>>::from_slice(simd, &bytes[i + k..i + k + width])
-            .simd_eq(needle)
-            .to_bitmask()
-            << k;
+        acc |= load_native(simd, bytes, i + k).simd_eq(needle).to_bitmask() << k;
         k += width;
     }
     acc
@@ -108,7 +131,7 @@ fn pair_mask_native<S: Simd>(simd: S, bytes: &[u8], i: usize, first: u8, second:
     let mut acc_second = 0_u64;
     let mut k = 0;
     while k < 64 {
-        let v = <S::u8s as SimdBase<S>>::from_slice(simd, &bytes[i + k..i + k + width]);
+        let v = load_native(simd, bytes, i + k);
         acc_first |= v.simd_eq(needle_first).to_bitmask() << k;
         acc_second |= v.simd_eq(needle_second).to_bitmask() << k;
         k += width;
@@ -141,7 +164,7 @@ fn quad_mask_native<S: Simd>(
     let mut acc_fourth = 0_u64;
     let mut k = 0;
     while k < 64 {
-        let v = <S::u8s as SimdBase<S>>::from_slice(simd, &bytes[i + k..i + k + width]);
+        let v = load_native(simd, bytes, i + k);
         acc_first |= v.simd_eq(needle_first).to_bitmask() << k;
         acc_second |= v.simd_eq(needle_second).to_bitmask() << k;
         acc_third |= v.simd_eq(needle_third).to_bitmask() << k;
@@ -156,10 +179,10 @@ fn quad_mask_native<S: Simd>(
 #[inline(always)]
 fn load64<S: Simd>(simd: S, bytes: &[u8], i: usize) -> [u8x16<S>; 4] {
     [
-        u8x16::from_slice(simd, &bytes[i..i + 16]),
-        u8x16::from_slice(simd, &bytes[i + 16..i + 32]),
-        u8x16::from_slice(simd, &bytes[i + 32..i + 48]),
-        u8x16::from_slice(simd, &bytes[i + 48..i + 64]),
+        load16(simd, bytes, i),
+        load16(simd, bytes, i + 16),
+        load16(simd, bytes, i + 32),
+        load16(simd, bytes, i + 48),
     ]
 }
 
@@ -326,8 +349,8 @@ fn classify_avx2(simd: Avx2, bytes: &[u8], i: usize) -> (u64, u64, u64) {
     let mut tok = 0_u64;
     let mut special = 0_u64;
     for (lane, b) in [
-        u8x32::from_slice(simd, &bytes[i..i + 32]),
-        u8x32::from_slice(simd, &bytes[i + 32..i + 64]),
+        load_native(simd, bytes, i),
+        load_native(simd, bytes, i + 32),
     ]
     .into_iter()
     .enumerate()
@@ -357,7 +380,7 @@ fn classify_avx512(simd: Avx512, bytes: &[u8], i: usize) -> (u64, u64, u64) {
     let lo_lut = u8x64::from_slice(simd, &LO_LUT64);
     let hi_lut = u8x64::from_slice(simd, &HI_LUT64);
     let zero = simd.splat_u8x64(0);
-    let b = u8x64::from_slice(simd, &bytes[i..i + 64]);
+    let b = load_native(simd, bytes, i);
     let lo = b & 0x0f;
     let cls = simd.swizzle_dyn_u8x64(lo_lut, lo) & simd.swizzle_dyn_u8x64(hi_lut, b >> 4);
     let ws = b.simd_eq(simd.swizzle_dyn_u8x64(ws_lut, lo));

@@ -89,7 +89,11 @@ pub(crate) fn scan_scalar(
     while i < bytes.len() {
         // Every arm leaves `i` on a decision point, so a token byte seen here
         // always starts a fresh token (token runs are consumed atomically).
-        match bytes[i] {
+        // `i` moves through opaque callees (skip_string, token_end), so the
+        // bounds check on this read does not fold into the loop condition.
+        // SAFETY: `i < bytes.len()` is the loop condition.
+        let b = unsafe { *bytes.get_unchecked(i) };
+        match b {
             b'{' | b'}' | b'[' | b']' | b',' | b':' => {
                 index.push(i as u32);
                 i += 1;
@@ -135,7 +139,10 @@ pub(crate) fn scan_scalar(
 pub(crate) fn token_end(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     while i < bytes.len() {
-        let b = bytes[i];
+        // SAFETY: `i < bytes.len()` is the loop condition; `i` only advances
+        // by whole classified steps (1 for ASCII, a decoded sequence length
+        // otherwise), so every re-entry satisfies it again.
+        let b = unsafe { *bytes.get_unchecked(i) };
         if b < 0x80 {
             if CLASSES[b as usize] & class::TOKEN == 0 {
                 break;
