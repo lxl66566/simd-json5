@@ -1,6 +1,6 @@
 //! DOM accessor semantics: lookups and index fallbacks, cross-variant
-//! number conversions, the equality contract, and ownership transfer
-//! through `into_owned`.
+//! number conversions, the equality contract, the mutable accessors, and
+//! ownership transfer through `into_owned`.
 
 use simd_json5::{Str, Value};
 
@@ -78,6 +78,24 @@ fn object_equality_ignores_member_order() {
     assert_eq!(v, reordered);
     let different = simd_json5::from_str(r"{ a: 1, b: 3 }").unwrap();
     assert_ne!(v, different);
+}
+
+/// `as_array_mut` lends a mutable slice and `as_object_mut` a mutable map;
+/// both reject non-matching variants.
+#[test]
+fn mut_accessors_are_variant_gated() {
+    let mut v = simd_json5::from_str(r"{ a: [1, 2] }").unwrap();
+    let root = v.as_object_mut().unwrap();
+    if let Some(arr) = root.get_mut("a").and_then(Value::as_array_mut) {
+        arr[1] = Value::from(30u64);
+    }
+    root.insert("c".into(), Value::from(7u64));
+    assert_eq!(v["a"][1], Value::U64(30));
+    assert_eq!(v["c"], Value::U64(7));
+
+    let mut scalar = Value::from("text");
+    assert!(scalar.as_array_mut().is_none());
+    assert!(scalar.as_object_mut().is_none());
 }
 
 /// `into_owned` deep-converts every borrowed string to an owned one, so

@@ -48,10 +48,9 @@ fn main() {
     {
         *retries = 5u64.into();
     }
-    if let Some(features) = root
-        .get_mut("features")
-        .and_then(simd_json5::Value::as_array_mut)
-    {
+    // as_array_mut lends a slice, which cannot grow; match the variant to
+    // append.
+    if let Some(simd_json5::Value::Array(features)) = root.get_mut("features") {
         features.push("tls".into());
     }
 

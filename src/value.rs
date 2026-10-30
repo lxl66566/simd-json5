@@ -239,7 +239,10 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Value<'a>>> {
+    /// Lends a mutable slice over the elements; the array cannot grow
+    /// through it. Match [`Self::Array`] to append.
+    #[must_use]
+    pub fn as_array_mut(&mut self) -> Option<&mut [Value<'a>]> {
         match self {
             Self::Array(v) => Some(v),
             _ => None,
@@ -254,6 +257,7 @@ impl<'a> Value<'a> {
         }
     }
 
+    #[must_use]
     pub fn as_object_mut(&mut self) -> Option<&mut Map<'a>> {
         match self {
             Self::Object(m) => Some(m),
