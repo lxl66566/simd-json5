@@ -384,7 +384,9 @@ impl<'a> From<Map<'a>> for Value<'a> {
 
 /// Compact serialization, identical to [`crate::to_string`], streamed into
 /// the formatter in chunks instead of materializing the whole document in a
-/// temporary `String` first.
+/// temporary `String` first. The alternate flag selects the pretty layout of
+/// [`crate::to_string_pretty`] (`{:#}`), following the std formatting
+/// convention.
 impl fmt::Display for Value<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         crate::ser::write_streaming(self, f)

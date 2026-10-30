@@ -637,16 +637,20 @@ impl<'f, 'a> FormatterSink<'f, 'a> {
     }
 }
 
-/// Serialize `value` into `f` chunk by chunk (the `Display` path); the output
-/// is valid UTF-8 by construction (see [`write_bytes`]).
+/// Serialize `value` into `f` chunk by chunk (the `Display` path): compact
+/// layout, or pretty under the alternate flag (`{:#}`), byte-identical to
+/// [`to_string`] / [`to_string_pretty`]. The output is valid UTF-8 by
+/// construction (see [`write_bytes`]).
 pub(crate) fn write_streaming(
     value: &Value<'_>,
     f: &mut core::fmt::Formatter<'_>,
 ) -> core::fmt::Result {
+    // Read before the sink borrows the formatter.
+    let pretty = f.alternate();
     let mut sink = FormatterSink::new(f);
     let mut writer = Writer {
         out: &mut sink,
-        pretty: false,
+        pretty,
         indent: 0,
     };
     writer.write_value(value);

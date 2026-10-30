@@ -174,6 +174,15 @@ fn display_matches_to_string() {
     assert_eq!(format!("{value}"), to_string(&value));
 }
 
+/// The alternate flag routes `Display` through the pretty writer, the std
+/// formatting convention; the default stays compact.
+#[test]
+fn display_alternate_matches_pretty() {
+    let value = sample();
+    assert_eq!(format!("{value:#}"), to_string_pretty(&value));
+    assert_eq!(format!("{value}"), to_string(&value));
+}
+
 /// `Display` streams through a chunked sink; a chunk boundary may split a
 /// multi-byte sequence, so long multibyte output must still round the
 /// formatter correctly.
