@@ -4,25 +4,25 @@ A fast, SIMD-accelerated JSON5 parser and serializer for Rust, with optional ser
 
 ## Benchmarks
 
-simd-json5 is the fastest JSON5 implementation on every corpus: in criterion runs it parses 1.4-3.0x faster than `json5` and 8-43x faster than `serde-json5`. Against JSON implementations it parses 1.2-1.5x faster than `serde_json` and serializes on par with it (ahead on `twitter.json`); the SIMD specialists `simd-json` and `sonic-rs` stay ahead on strict-JSON input (up to ~4.9x).
+simd-json5 is the fastest JSON5 implementation on every corpus: 1.5-3.0x faster than `json5` and 8-42x faster than `serde-json5`. Against `serde_json` it parses up to 1.5x faster (behind on `canada.json`) and serializes on par (ahead on `twitter.json`); the SIMD specialists `simd-json` and `sonic-rs` stay ahead on most strict-JSON input (up to ~4.8x).
 
 Parse throughput, decimal MB/s, higher is better:
 
 | Corpus            | simd-json5 | json5 | serde-json5 | serde_json | simd-json | sonic-rs |
 | ----------------- | ---------: | ----: | ----------: | ---------: | --------: | -------: |
-| twitter.json      |    **683** |   228 |          16 |        441 |       601 |     2099 |
-| citm_catalog.json |    **810** |   325 |          32 |        578 |      1330 |     2346 |
-| canada.json       |    **306** |   213 |          38 |        256 |       621 |     1485 |
-| json5.json5       |    **276** |   186 |          30 |          - |         - |        - |
+| twitter.json      |    **673** |   225 |          16 |        441 |       604 |     2114 |
+| citm_catalog.json |    **796** |   321 |          32 |        576 |      1330 |     2419 |
+| canada.json       |    **308** |   210 |          37 |        343 |       620 |     1481 |
+| json5.json5       |    **273** |   183 |          29 |          - |         - |        - |
 
 Serialization throughput, decimal MB/s, higher is better:
 
 | Corpus            | simd-json5 | json5 | serde-json5 | serde_json |
 | ----------------- | ---------: | ----: | ----------: | ---------: |
-| twitter.json      |   **3009** |   234 |         231 |       2864 |
-| citm_catalog.json |       4541 |   423 |         773 |   **5180** |
-| canada.json       |       1057 |   112 |         318 |   **1098** |
-| json5.json5       |   **1821** |   269 |         375 |          - |
+| twitter.json      |   **3006** |   232 |         237 |       2276 |
+| citm_catalog.json |       4621 |   414 |         772 |   **4813** |
+| canada.json       |       1048 |   106 |         318 |   **1078** |
+| json5.json5       |   **1831** |   271 |         374 |          - |
 
 Reproduce with `uv run benches/report.py --run`; `cargo bench --bench parse --bench serialize` runs the full criterion suites.
 
@@ -66,9 +66,9 @@ assert_eq!(simd_json5::typed::to_string(&p).unwrap(), r#"{"x":1,"y":2}"#);
 
 ## Safety
 
-Production code uses `unsafe` sparingly: 11 blocks, each with a safety argument and its invariant.
+Production code uses `unsafe` sparingly: 15 blocks, each with a safety argument and its invariant.
 
-A 1.83-billion-execution libFuzzer campaign found no crashes (0.2.0); see `fuzz/README.md`.
+437M execution libFuzzer campaign across all four targets found no crashes on v0.3.1; earlier 1.83B execution campaign ran against v0.2.0; see `fuzz/README.md`.
 
 ## Serialization notes
 
