@@ -272,9 +272,8 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// else goes through the seq path, so arrays of numbers still work and
     /// other inputs produce serde's type errors.
     fn parse_bytes<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
-        match self.peek_byte() {
-            Some(b'"' | b'\'') => {
-                let off = self.offset();
+        match self.peek_entry() {
+            Some((b'"' | b'\'', off)) => {
                 let s = self.string(off)?;
                 self.bump();
                 match s {
@@ -403,8 +402,8 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Dispatch a value to `visitor` by its entry kind.
     fn parse_value<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
         match self.peek_entry() {
-            Some((b'[', _)) => self.parse_array(visitor),
-            Some((b'{', _)) => self.parse_object(visitor),
+            Some((b'[', off)) => self.parse_array(visitor, off),
+            Some((b'{', off)) => self.parse_object(visitor, off),
             Some((b, off)) if number::is_num_start(b) => {
                 visit_num(self.parse_current_num(off)?, visitor)
             },
@@ -430,12 +429,13 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     }
 
     /// Parse an array through `visit_seq`. Elements past an early visitor
-    /// stop are validated and skipped by `finish_seq`.
-    fn parse_array<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
+    /// stop are validated and skipped by `finish_seq`. `off` is the `[`
+    /// entry's offset, already looked up by the dispatcher.
+    fn parse_array<V: Visitor<'de>>(&mut self, visitor: V, off: usize) -> Result<V::Value> {
         // Capture the `[` entry's index position for the counts table
         // before `open_container` advances past it.
         let open = self.pos;
-        self.open_container(self.offset())?;
+        self.open_container(off)?;
         let saved = self.started;
         self.started = false;
         let result = visitor.visit_seq(SeqAccess {
@@ -460,10 +460,11 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     }
 
     /// Parse an object through `visit_map`. Members past an early visitor
-    /// stop are validated and skipped by `finish_map`.
-    fn parse_object<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
+    /// stop are validated and skipped by `finish_map`. `off` is the `{`
+    /// entry's offset, already looked up by the dispatcher.
+    fn parse_object<V: Visitor<'de>>(&mut self, visitor: V, off: usize) -> Result<V::Value> {
         let open = self.pos;
-        self.open_container(self.offset())?;
+        self.open_container(off)?;
         let saved = self.started;
         self.started = false;
         let result = visitor.visit_map(MapAccess {
@@ -490,20 +491,20 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// stands on the `]` (not consumed); `Ok(true)` means an element follows
     /// at the cursor with its leading `,` already consumed.
     fn seq_step(&mut self, started: bool) -> Result<bool> {
-        match self.peek_byte() {
-            Some(b']') => Ok(false),
-            Some(b',') if started => {
+        match self.peek_entry() {
+            Some((b']', _)) => Ok(false),
+            Some((b',', _)) if started => {
                 self.bump();
                 // One optional trailing comma directly before `]`.
                 Ok(self.peek_byte() != Some(b']'))
             },
             // `:` and `}` keep stage 2's byte-specific errors after an
             // element; value starts report the missing separator.
-            Some(b @ (b':' | b'}')) if started => Err(Error::UnexpectedChar {
+            Some((b @ (b':' | b'}'), off)) if started => Err(Error::UnexpectedChar {
                 byte: b,
-                offset: self.offset(),
+                offset: off,
             }),
-            Some(_) if started => Err(syntax("expected ',' or ']'", self.offset())),
+            Some((_, off)) if started => Err(syntax("expected ',' or ']'", off)),
             // Before the first element a `,` stays for `parse_scalar` to
             // reject, matching stage 2's `after_element` logic.
             Some(_) => Ok(true),
@@ -516,23 +517,19 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Advance past one object member boundary. `Ok(false)` means the cursor
     /// stands on the `}` (not consumed); `Ok(true)` means a key follows.
     fn map_step(&mut self, started: bool) -> Result<bool> {
-        match self.peek_byte() {
-            Some(b'}') => Ok(false),
-            Some(b',') if started => {
+        match self.peek_entry() {
+            Some((b'}', _)) => Ok(false),
+            Some((b',', _)) if started => {
                 self.bump();
                 // One optional trailing comma directly before `}`.
                 Ok(self.peek_byte() != Some(b'}'))
             },
             // `:` and `]` keep stage 2's byte-specific errors after a member.
-            Some(b':') if started => Err(Error::UnexpectedChar {
-                byte: b':',
-                offset: self.offset(),
+            Some((b @ (b':' | b']'), off)) if started => Err(Error::UnexpectedChar {
+                byte: b,
+                offset: off,
             }),
-            Some(b']') if started => Err(Error::UnexpectedChar {
-                byte: b']',
-                offset: self.offset(),
-            }),
-            Some(_) if started => Err(syntax("expected ',' or '}'", self.offset())),
+            Some((_, off)) if started => Err(syntax("expected ',' or '}'", off)),
             // Before the first member these are rejected by `next_key`.
             Some(_) => Ok(true),
             None => Err(Error::UnexpectedEof {
@@ -545,12 +542,11 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// its entry. Everything else a key position may contain is rejected the
     /// way stage 2 rejects it.
     fn next_key(&mut self) -> Result<Str<'de>> {
-        let Some(b) = self.peek_byte() else {
+        let Some((b, off)) = self.peek_entry() else {
             return Err(Error::UnexpectedEof {
                 offset: self.bytes.len(),
             });
         };
-        let off = self.offset();
         match b {
             b'"' | b'\'' => {
                 let s = self.string(off)?;
@@ -580,12 +576,12 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Consume the `:` after a key; any other entry reports stage 2's
     /// `expected ':'` state error.
     fn expect_colon(&mut self) -> Result<()> {
-        match self.peek_byte() {
-            Some(b':') => {
+        match self.peek_entry() {
+            Some((b':', _)) => {
                 self.bump();
                 Ok(())
             },
-            Some(_) => Err(syntax("expected ':'", self.offset())),
+            Some((_, off)) => Err(syntax("expected ':'", off)),
             None => Err(Error::UnexpectedEof {
                 offset: self.bytes.len(),
             }),
@@ -628,12 +624,11 @@ impl<'a, 'de> Deserializer<'a, 'de> {
     /// Recursive like `parse_value` but with minimal frames; the depth guard
     /// bounds the recursion.
     fn skip_value(&mut self, ctx: Ctx) -> Result<()> {
-        let Some(b) = self.peek_byte() else {
+        let Some((b, off)) = self.peek_entry() else {
             return Err(Error::UnexpectedEof {
                 offset: self.bytes.len(),
             });
         };
-        let off = self.offset();
         match b {
             b'[' => {
                 self.open_container(off)?;
@@ -1615,20 +1610,19 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'_, 'de> {
     where
         V: Visitor<'de>,
     {
-        match self.peek_byte() {
-            Some(b'"' | b'\'') => {
-                let off = self.offset();
+        match self.peek_entry() {
+            Some((b'"' | b'\'', off)) => {
                 let variant = self.string(off)?;
                 self.bump();
                 visitor.visit_enum(UnitVariantAccess { variant })
             },
-            Some(b'{') => {
-                self.open_container(self.offset())?;
+            Some((b'{', off)) => {
+                self.open_container(off)?;
                 let result = visitor.visit_enum(EnumMapAccess { de: &mut *self });
                 self.depth -= 1;
                 result
             },
-            Some(b'[') => Err(de::Error::invalid_type(Unexpected::Seq, &visitor)),
+            Some((b'[', _)) => Err(de::Error::invalid_type(Unexpected::Seq, &visitor)),
             _ => {
                 let v = self.parse_scalar()?;
                 Err(invalid_type_value(&v, &visitor))
